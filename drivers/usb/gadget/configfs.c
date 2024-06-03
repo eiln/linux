@@ -606,9 +606,10 @@ static struct config_group *function_make(
 	char *instance_name;
 	int ret;
 
-	ret = snprintf(buf, MAX_NAME_LEN, "%s", name);
-	if (ret >= MAX_NAME_LEN)
+	if (strlen(name) >= MAX_NAME_LEN)
 		return ERR_PTR(-ENAMETOOLONG);
+
+	scnprintf(buf, MAX_NAME_LEN, "%s", name);
 
 	func_name = buf;
 	instance_name = strchr(func_name, '.');
@@ -701,9 +702,11 @@ static struct config_group *config_desc_make(
 	int ret;
 
 	gi = container_of(group, struct gadget_info, configs_group);
-	ret = snprintf(buf, MAX_NAME_LEN, "%s", name);
-	if (ret >= MAX_NAME_LEN)
+
+	if (strlen(name) >= MAX_NAME_LEN)
 		return ERR_PTR(-ENAMETOOLONG);
+
+	scnprintf(buf, MAX_NAME_LEN, "%s", name);
 
 	num_str = strchr(buf, '.');
 	if (!num_str) {
@@ -812,7 +815,7 @@ static ssize_t gadget_string_s_show(struct config_item *item, char *page)
 	struct gadget_string *string = to_gadget_string(item);
 	int ret;
 
-	ret = snprintf(page, sizeof(string->string), "%s\n", string->string);
+	ret = sysfs_emit(page, "%s\n", string->string);
 	return ret;
 }
 
@@ -1760,6 +1763,9 @@ static int configfs_composite_bind(struct usb_gadget *gadget,
 
 		if (gadget_is_otg(gadget))
 			c->descriptors = otg_desc;
+
+		/* Properly configure the bmAttributes wakeup bit */
+		check_remote_wakeup_config(gadget, c);
 
 		cfg = container_of(c, struct config_usb_cfg, c);
 		if (!list_empty(&cfg->string_list)) {

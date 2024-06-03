@@ -14,8 +14,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/io.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -154,7 +154,7 @@ static const struct wcnss_data pronto_v3_data = {
 
 static int wcnss_load(struct rproc *rproc, const struct firmware *fw)
 {
-	struct qcom_wcnss *wcnss = (struct qcom_wcnss *)rproc->priv;
+	struct qcom_wcnss *wcnss = rproc->priv;
 	int ret;
 
 	ret = qcom_mdt_load(wcnss->dev, fw, rproc->firmware, WCNSS_PAS_ID,
@@ -227,7 +227,7 @@ static void wcnss_configure_iris(struct qcom_wcnss *wcnss)
 
 static int wcnss_start(struct rproc *rproc)
 {
-	struct qcom_wcnss *wcnss = (struct qcom_wcnss *)rproc->priv;
+	struct qcom_wcnss *wcnss = rproc->priv;
 	int ret, i;
 
 	mutex_lock(&wcnss->iris_lock);
@@ -293,7 +293,7 @@ release_iris_lock:
 
 static int wcnss_stop(struct rproc *rproc)
 {
-	struct qcom_wcnss *wcnss = (struct qcom_wcnss *)rproc->priv;
+	struct qcom_wcnss *wcnss = rproc->priv;
 	int ret;
 
 	if (wcnss->state) {
@@ -320,7 +320,7 @@ static int wcnss_stop(struct rproc *rproc)
 
 static void *wcnss_da_to_va(struct rproc *rproc, u64 da, size_t len, bool *is_iomem)
 {
-	struct qcom_wcnss *wcnss = (struct qcom_wcnss *)rproc->priv;
+	struct qcom_wcnss *wcnss = rproc->priv;
 	int offset;
 
 	offset = da - wcnss->mem_reloc;
@@ -506,27 +506,25 @@ static int wcnss_request_irq(struct qcom_wcnss *wcnss,
 
 static int wcnss_alloc_memory_region(struct qcom_wcnss *wcnss)
 {
+	struct reserved_mem *rmem = NULL;
 	struct device_node *node;
-	struct resource r;
-	int ret;
 
 	node = of_parse_phandle(wcnss->dev->of_node, "memory-region", 0);
-	if (!node) {
-		dev_err(wcnss->dev, "no memory-region specified\n");
+	if (node)
+		rmem = of_reserved_mem_lookup(node);
+	of_node_put(node);
+
+	if (!rmem) {
+		dev_err(wcnss->dev, "unable to resolve memory-region\n");
 		return -EINVAL;
 	}
 
-	ret = of_address_to_resource(node, 0, &r);
-	of_node_put(node);
-	if (ret)
-		return ret;
-
-	wcnss->mem_phys = wcnss->mem_reloc = r.start;
-	wcnss->mem_size = resource_size(&r);
+	wcnss->mem_phys = wcnss->mem_reloc = rmem->base;
+	wcnss->mem_size = rmem->size;
 	wcnss->mem_region = devm_ioremap_wc(wcnss->dev, wcnss->mem_phys, wcnss->mem_size);
 	if (!wcnss->mem_region) {
 		dev_err(wcnss->dev, "unable to map memory region: %pa+%zx\n",
-			&r.start, wcnss->mem_size);
+			&rmem->base, wcnss->mem_size);
 		return -EBUSY;
 	}
 
@@ -538,7 +536,6 @@ static int wcnss_probe(struct platform_device *pdev)
 	const char *fw_name = WCNSS_FIRMWARE_NAME;
 	const struct wcnss_data *data;
 	struct qcom_wcnss *wcnss;
-	struct resource *res;
 	struct rproc *rproc;
 	void __iomem *mmio;
 	int ret;
@@ -566,7 +563,7 @@ static int wcnss_probe(struct platform_device *pdev)
 	}
 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
 
-	wcnss = (struct qcom_wcnss *)rproc->priv;
+	wcnss = rproc->priv;
 	wcnss->dev = &pdev->dev;
 	wcnss->rproc = rproc;
 	platform_set_drvdata(pdev, wcnss);
@@ -576,8 +573,7 @@ static int wcnss_probe(struct platform_device *pdev)
 
 	mutex_init(&wcnss->iris_lock);
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pmu");
-	mmio = devm_ioremap_resource(&pdev->dev, res);
+	mmio = devm_platform_ioremap_resource_byname(pdev, "pmu");
 	if (IS_ERR(mmio)) {
 		ret = PTR_ERR(mmio);
 		goto free_rproc;
@@ -666,7 +662,7 @@ free_rproc:
 	return ret;
 }
 
-static int wcnss_remove(struct platform_device *pdev)
+static void wcnss_remove(struct platform_device *pdev)
 {
 	struct qcom_wcnss *wcnss = platform_get_drvdata(pdev);
 
@@ -678,8 +674,6 @@ static int wcnss_remove(struct platform_device *pdev)
 	qcom_remove_smd_subdev(wcnss->rproc, &wcnss->smd_subdev);
 	wcnss_release_pds(wcnss);
 	rproc_free(wcnss->rproc);
-
-	return 0;
 }
 
 static const struct of_device_id wcnss_of_match[] = {
@@ -693,7 +687,7 @@ MODULE_DEVICE_TABLE(of, wcnss_of_match);
 
 static struct platform_driver wcnss_driver = {
 	.probe = wcnss_probe,
-	.remove = wcnss_remove,
+	.remove_new = wcnss_remove,
 	.driver = {
 		.name = "qcom-wcnss-pil",
 		.of_match_table = wcnss_of_match,

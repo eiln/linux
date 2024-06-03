@@ -13,8 +13,10 @@
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hid.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dockchannel.h>
+#include <linux/string.h>
 #include <linux/of.h>
 #include "../hid-ids.h"
 
@@ -42,10 +44,6 @@ struct dchid_hdr {
 
 #define FLAGS_GROUP GENMASK(7, 6)
 #define FLAGS_REQ GENMASK(5, 0)
-
-#define GROUP_INPUT 0
-#define GROUP_OUTPUT 1
-#define GROUP_CMD 2
 
 #define REQ_SET_REPORT 0
 #define REQ_GET_REPORT 1
@@ -360,7 +358,7 @@ done:
 
 static int dchid_comm_cmd(struct dockchannel_hid *dchid, void *cmd, size_t size)
 {
-	return dchid_cmd(dchid->comm, GROUP_CMD, REQ_SET_REPORT, cmd, size, NULL, 0);
+	return dchid_cmd(dchid->comm, HID_FEATURE_REPORT, REQ_SET_REPORT, cmd, size, NULL, 0);
 }
 
 static int dchid_enable_interface(struct dchid_iface *iface)
@@ -590,7 +588,7 @@ static int dchid_parse(struct hid_device *hdev)
 /* Note: buf excludes report number! For ease of fetching strings/etc. */
 static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum, void *buf, size_t len)
 {
-	int ret = dchid_cmd(iface, GROUP_CMD, REQ_GET_REPORT, &reportnum, 1, buf, len);
+	int ret = dchid_cmd(iface, HID_FEATURE_REPORT, REQ_GET_REPORT, &reportnum, 1, buf, len);
 
 	return ret <= 0 ? ret : ret - 1;
 }
@@ -598,7 +596,7 @@ static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum, void *b
 /* Note: buf includes report number! */
 static int dchid_set_report(struct dchid_iface *iface, void *buf, size_t len)
 {
-	return dchid_cmd(iface, GROUP_OUTPUT, REQ_SET_REPORT, buf, len, NULL, 0);
+	return dchid_cmd(iface, HID_OUTPUT_REPORT, REQ_SET_REPORT, buf, len, NULL, 0);
 }
 
 static int dchid_raw_request(struct hid_device *hdev,
@@ -610,7 +608,7 @@ static int dchid_raw_request(struct hid_device *hdev,
 	switch (reqtype) {
 	case HID_REQ_GET_REPORT:
 		buf[0] = reportnum;
-		return dchid_cmd(iface, GROUP_OUTPUT, REQ_GET_REPORT, &reportnum, 1, buf + 1, len - 1);
+		return dchid_cmd(iface, rtype, REQ_GET_REPORT, &reportnum, 1, buf + 1, len - 1);
 	case HID_REQ_SET_REPORT:
 		return dchid_set_report(iface, buf, len);
 	default:
@@ -819,7 +817,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 				break;
 			}
 
-			strlcpy(iface->gpio_name, req->name, MAX_GPIO_NAME);
+			strscpy(iface->gpio_name, req->name, MAX_GPIO_NAME);
 			iface->gpio_id = req->id;
 			break;
 		}
@@ -965,7 +963,7 @@ static void dchid_packet_work(struct work_struct *ws)
 	}
 
 	switch (type) {
-	case GROUP_INPUT:
+	case HID_INPUT_REPORT:
 		if (work->hdr.iface == IFACE_COMM)
 			dchid_handle_event(dchid, payload, shdr->length);
 		else

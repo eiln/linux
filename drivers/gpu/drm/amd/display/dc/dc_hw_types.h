@@ -244,7 +244,7 @@ enum pixel_format {
 #define DC_MAX_DIRTY_RECTS 3
 struct dc_flip_addrs {
 	struct dc_plane_address address;
-	unsigned int flip_timestamp_in_us;
+	unsigned long long flip_timestamp_in_us;
 	bool flip_immediate;
 	/* TODO: add flip duration for FreeSync */
 	bool triplebuffer_flips;
@@ -465,6 +465,7 @@ struct dc_cursor_mi_param {
 	struct fixed31_32 v_scale_ratio;
 	enum dc_rotation_angle rotation;
 	bool mirror;
+	struct dc_stream_state *stream;
 };
 
 /* IPP related types */
@@ -769,9 +770,6 @@ struct dc_crtc_timing_flags {
 	uint32_t LTE_340MCSC_SCRAMBLE:1;
 
 	uint32_t DSC : 1; /* Use DSC with this timing */
-#ifndef TRIM_FSFT
-	uint32_t FAST_TRANSPORT: 1;
-#endif
 	uint32_t VBLANK_SYNCHRONIZABLE: 1;
 };
 
@@ -829,7 +827,7 @@ struct dc_dsc_config {
 	uint32_t version_minor; /* DSC minor version. Full version is formed as 1.version_minor. */
 	bool ycbcr422_simple; /* Tell DSC engine to convert YCbCr 4:2:2 to 'YCbCr 4:2:2 simple'. */
 	int32_t rc_buffer_size; /* DSC RC buffer block size in bytes */
-#if defined(CONFIG_DRM_AMD_DC_DCN)
+#if defined(CONFIG_DRM_AMD_DC_FP)
 	bool is_frl; /* indicate if DSC is applied based on HDMI FRL sink's capability */
 #endif
 	bool is_dp; /* indicate if DSC is applied based on DP's capability */
@@ -949,10 +947,6 @@ struct dc_crtc_timing {
 	enum dc_pixel_encoding pixel_encoding;
 	enum dc_aspect_ratio aspect_ratio;
 	enum scanning_type scan_type;
-
-#ifndef TRIM_FSFT
-	uint32_t fast_transport_output_rate_100hz;
-#endif
 
 	struct dc_crtc_timing_flags flags;
 	uint32_t dsc_fixed_bits_per_pixel_x16; /* DSC target bitrate in 1/16 of bpp (e.g. 128 -> 8bpp) */
@@ -1083,6 +1077,20 @@ struct tg_color {
 	uint16_t color_r_cr;
 	uint16_t color_g_y;
 	uint16_t color_b_cb;
+};
+
+enum symclk_state {
+	SYMCLK_OFF_TX_OFF,
+	SYMCLK_ON_TX_ON,
+	SYMCLK_ON_TX_OFF,
+};
+
+struct phy_state {
+	struct {
+		uint8_t otg		: 1;
+		uint8_t reserved	: 7;
+	} symclk_ref_cnts;
+	enum symclk_state symclk_state;
 };
 
 #endif /* DC_HW_TYPES_H */

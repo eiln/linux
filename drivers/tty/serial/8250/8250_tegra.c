@@ -11,6 +11,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
 
@@ -112,28 +113,28 @@ static int tegra_uart_probe(struct platform_device *pdev)
 
 	ret = serial8250_register_8250_port(&port8250);
 	if (ret < 0)
-		goto err_clkdisable;
+		goto err_ctrl_assert;
 
 	platform_set_drvdata(pdev, uart);
 	uart->line = ret;
 
 	return 0;
 
+err_ctrl_assert:
+	reset_control_assert(uart->rst);
 err_clkdisable:
 	clk_disable_unprepare(uart->clk);
 
 	return ret;
 }
 
-static int tegra_uart_remove(struct platform_device *pdev)
+static void tegra_uart_remove(struct platform_device *pdev)
 {
 	struct tegra_uart *uart = platform_get_drvdata(pdev);
 
 	serial8250_unregister_port(uart->line);
 	reset_control_assert(uart->rst);
 	clk_disable_unprepare(uart->clk);
-
-	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -189,7 +190,7 @@ static struct platform_driver tegra_uart_driver = {
 		.acpi_match_table = ACPI_PTR(tegra_uart_acpi_match),
 	},
 	.probe = tegra_uart_probe,
-	.remove = tegra_uart_remove,
+	.remove_new = tegra_uart_remove,
 };
 
 module_platform_driver(tegra_uart_driver);

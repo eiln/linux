@@ -179,7 +179,7 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, di);
 
 	if (client->irq) {
-		ret = devm_request_threaded_irq(&client->dev, client->irq,
+		ret = request_threaded_irq(client->irq,
 				NULL, bq27xxx_battery_irq_handler_thread,
 				IRQF_ONESHOT,
 				di->name, di);
@@ -208,6 +208,9 @@ err_failed:
 static void bq27xxx_battery_i2c_remove(struct i2c_client *client)
 {
 	struct bq27xxx_device_info *di = i2c_get_clientdata(client);
+
+	if (client->irq)
+		free_irq(client->irq, di);
 
 	bq27xxx_battery_teardown(di);
 
@@ -294,8 +297,9 @@ static struct i2c_driver bq27xxx_battery_i2c_driver = {
 	.driver = {
 		.name = "bq27xxx-battery",
 		.of_match_table = of_match_ptr(bq27xxx_battery_i2c_of_match_table),
+		.pm = &bq27xxx_battery_battery_pm_ops,
 	},
-	.probe_new = bq27xxx_battery_i2c_probe,
+	.probe = bq27xxx_battery_i2c_probe,
 	.remove = bq27xxx_battery_i2c_remove,
 	.id_table = bq27xxx_i2c_id_table,
 };

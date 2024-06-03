@@ -3287,7 +3287,7 @@ static void sony_nc_remove(struct acpi_device *device)
 	dprintk(SONY_NC_DRIVER_NAME " removed.\n");
 }
 
-static const struct acpi_device_id sony_device_ids[] = {
+static const struct acpi_device_id sony_device_ids[] __maybe_unused = {
 	{SONY_NC_HID, 0},
 	{SONY_PIC_HID, 0},
 	{"", 0},
@@ -4092,7 +4092,7 @@ static ssize_t sonypi_misc_read(struct file *file, char __user *buf,
 
 	if (ret > 0) {
 		struct inode *inode = file_inode(file);
-		inode->i_atime = current_time(inode);
+		inode_set_atime_to_ts(inode, current_time(inode));
 	}
 
 	return ret;

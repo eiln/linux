@@ -55,6 +55,15 @@ impl super::Queue::ver {
 
         mod_dev_dbg!(self.dev, "[Submission {}] Compute!\n", id);
 
+        if cmd.cmd_buffer_size as usize != core::mem::size_of::<uapi::drm_asahi_cmd_compute>() {
+            cls_pr_debug!(
+                Errors,
+                "Invalid compute command size ({:#x})\n",
+                cmd.cmd_buffer_size
+            );
+            return Err(EINVAL);
+        }
+
         let mut cmdbuf_reader = unsafe {
             UserSlicePtr::new(
                 cmd.cmd_buffer as usize as *mut _,
@@ -72,7 +81,7 @@ impl super::Queue::ver {
         }
         let cmdbuf = unsafe { cmdbuf.assume_init() };
 
-        if cmdbuf.flags != 0 {
+        if cmdbuf.flags & !(uapi::ASAHI_COMPUTE_NO_PREEMPTION as u64) != 0 {
             return Err(EINVAL);
         }
 
@@ -95,19 +104,16 @@ impl super::Queue::ver {
         let comp_job = job.get_comp()?;
         let ev_comp = comp_job.event_info();
 
-        // TODO: Is this the same on all GPUs? Is this really for preemption?
-        let preempt_size = 0x7fa0;
-        let preempt2_off = 0x7f80;
-        let preempt3_off = 0x7f88;
-        let preempt4_off = 0x7f90;
-        let preempt5_off = 0x7f98;
+        let preempt2_off = gpu.get_cfg().compute_preempt1_size;
+        let preempt3_off = preempt2_off + 8;
+        let preempt4_off = preempt3_off + 8;
+        let preempt5_off = preempt4_off + 8;
+        let preempt_size = preempt5_off + 8;
 
-        let preempt_buf = self.ualloc.lock().array_empty(preempt_size)?;
-
-        let mut seq_buf = self.ualloc.lock().array_empty(0x800)?;
-        for i in 1..0x400 {
-            seq_buf[i] = (i + 1) as u64;
-        }
+        let preempt_buf = self
+            .ualloc
+            .lock()
+            .array_empty_tagged(preempt_size, b"CPMT")?;
 
         mod_dev_dbg!(
             self.dev,
@@ -136,7 +142,6 @@ impl super::Queue::ver {
                 let vm_bind = vm_bind.clone();
                 try_init!(fw::compute::RunCompute::ver {
                     preempt_buf: preempt_buf,
-                    seq_buf: seq_buf,
                     micro_seq: {
                         let mut builder = microseq::Builder::new();
 
@@ -145,7 +150,12 @@ impl super::Queue::ver {
                         let start_comp = builder.add(microseq::StartCompute::ver {
                             header: microseq::op::StartCompute::HEADER,
                             unk_pointer: inner_weak_ptr!(ptr, unk_pointee),
-                            job_params1: inner_weak_ptr!(ptr, job_params1),
+                            #[ver(G < G14X)]
+                            job_params1: Some(inner_weak_ptr!(ptr, job_params1)),
+                            #[ver(G >= G14X)]
+                            job_params1: None,
+                            #[ver(G >= G14X)]
+                            registers: inner_weak_ptr!(ptr, registers),
                             stats,
                             work_queue: ev_comp.info_ptr,
                             vm_slot: vm_bind.slot(),
@@ -252,7 +262,7 @@ impl super::Queue::ver {
                     timestamps,
                 })
             },
-            |inner, _p| {
+            |inner, _ptr| {
                 let vm_slot = vm_bind.slot();
                 try_init!(fw::compute::raw::RunCompute::ver {
                     tag: fw::workqueue::CommandType::RunCompute,
@@ -262,6 +272,9 @@ impl super::Queue::ver {
                     vm_slot,
                     notifier: inner.notifier.gpu_pointer(),
                     unk_pointee: Default::default(),
+                    #[ver(G < G14X)]
+                    __pad0: Default::default(),
+                    #[ver(G < G14X)]
                     job_params1 <- try_init!(fw::compute::raw::JobParameters1 {
                         preempt_buf1: inner.preempt_buf.gpu_pointer(),
                         encoder: U64(cmdbuf.encoder_ptr),
@@ -272,16 +285,40 @@ impl super::Queue::ver {
                         preempt_buf5: inner.preempt_buf.gpu_offset_pointer(preempt5_off),
                         pipeline_base: U64(0x11_00000000),
                         unk_38: U64(0x8c60),
-                        unk_40: cmdbuf.ctx_switch_prog, // Internal program addr | 1
+                        helper_program: cmdbuf.helper_program, // Internal program addr | 1
                         unk_44: 0,
-                        compute_layout_addr: U64(cmdbuf.buffer_descriptor), // Only if internal program used
-                        unk_50: cmdbuf.buffer_descriptor_size, // 0x40 if internal program used
+                        helper_arg: U64(cmdbuf.helper_arg), // Only if internal program used
+                        helper_cfg: cmdbuf.helper_cfg, // 0x40 if internal program used
                         unk_54: 0,
                         unk_58: 1,
                         unk_5c: 0,
                         iogpu_unk_40: cmdbuf.iogpu_unk_40, // 0x1c if internal program used
+                        __pad: Default::default(),
                     }),
-                    unk_b8: Default::default(),
+                    #[ver(G >= G14X)]
+                    registers: fw::job::raw::RegisterArray::new(
+                        inner_weak_ptr!(_ptr, registers.registers),
+                        |r| {
+                            r.add(0x1a510, inner.preempt_buf.gpu_pointer().into());
+                            r.add(0x1a420, cmdbuf.encoder_ptr);
+                            // buf2-5 Only if internal program is used
+                            r.add(0x1a4d0, inner.preempt_buf.gpu_offset_pointer(preempt2_off).into());
+                            r.add(0x1a4d8, inner.preempt_buf.gpu_offset_pointer(preempt3_off).into());
+                            r.add(0x1a4e0, inner.preempt_buf.gpu_offset_pointer(preempt4_off).into());
+                            r.add(0x1a4e8, inner.preempt_buf.gpu_offset_pointer(preempt5_off).into());
+                            r.add(0x10071, 0x1100000000); // USC_EXEC_BASE_CP
+                            r.add(0x11841, cmdbuf.helper_program.into());
+                            r.add(0x11849, cmdbuf.helper_arg);
+                            r.add(0x11f81, cmdbuf.helper_cfg.into());
+                            r.add(0x1a440, 0x24201);
+                            r.add(0x12091, cmdbuf.iogpu_unk_40.into());
+                            /*
+                            r.add(0x10201, 0x100); // Some kind of counter?? Does this matter?
+                            r.add(0x10428, 0x100); // Some kind of counter?? Does this matter?
+                            */
+                        }
+                    ),
+                    __pad1: Default::default(),
                     microsequence: inner.micro_seq.gpu_pointer(),
                     microsequence_size: inner.micro_seq.len() as u32,
                     job_params2 <- try_init!(fw::compute::raw::JobParameters2::ver {
@@ -291,24 +328,32 @@ impl super::Queue::ver {
                         preempt_buf1: inner.preempt_buf.gpu_pointer(),
                         encoder_end: U64(cmdbuf.encoder_end),
                         unk_34: Default::default(),
+                        #[ver(G < G14X)]
+                        unk_g14x: 0,
+                        #[ver(G >= G14X)]
+                        unk_g14x: 0x24201,
+                        unk_58: 0,
                         #[ver(V < V13_0B4)]
                         unk_5c: 0,
                     }),
                     encoder_params <- try_init!(fw::job::raw::EncoderParams {
                         unk_8: 0x0,     // fixed
-                        large_tib: 0x0, // check!
+                        sync_grow: 0x0, // check!
                         unk_10: 0x0,    // fixed
                         encoder_id: cmdbuf.encoder_id,
                         unk_18: 0x0, // fixed
-                        iogpu_compute_unk44: cmdbuf.iogpu_unk_44,
-                        seq_buffer: U64(inner.seq_buf.gpu_pointer().into()),
-                        unk_28: U64(0x0), // fixed
+                        unk_mask: cmdbuf.unk_mask,
+                        sampler_array: U64(cmdbuf.sampler_array),
+                        sampler_count: cmdbuf.sampler_count,
+                        sampler_max: cmdbuf.sampler_max,
                     }),
                     meta <- try_init!(fw::job::raw::JobMeta {
                         unk_0: 0,
                         unk_2: 0,
                         // TODO: make separate flag
-                        no_preemption: ((cmdbuf.ctx_switch_prog & 1) == 0) as u8,
+                        no_preemption: (cmdbuf.flags
+                        & uapi::ASAHI_COMPUTE_NO_PREEMPTION as u64
+                        != 0) as u8,
                         stamp: ev_comp.stamp_pointer,
                         fw_stamp: ev_comp.fw_stamp_pointer,
                         stamp_value: ev_comp.value.next(),

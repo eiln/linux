@@ -3,7 +3,7 @@
 //! Top-level GPU driver implementation.
 
 use kernel::{
-    c_str, device, drm, drm::drv, drm::ioctl, error::Result, of, platform, prelude::*, sync::Arc,
+    c_str, device, drm, drm::drv, drm::ioctl, error::code, error::Result, of, platform, prelude::*, sync::Arc,
 };
 
 use crate::{debug, file, gem, gpu, hw, regs};
@@ -56,23 +56,23 @@ impl drv::Driver for AsahiDriver {
 
     kernel::declare_drm_ioctls! {
         (ASAHI_GET_PARAMS,      drm_asahi_get_params,
-                          ioctl::RENDER_ALLOW, file::File::get_params),
+                          ioctl::RENDER_ALLOW, crate::file::File::get_params),
         (ASAHI_VM_CREATE,       drm_asahi_vm_create,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::vm_create),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::vm_create),
         (ASAHI_VM_DESTROY,      drm_asahi_vm_destroy,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::vm_destroy),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::vm_destroy),
         (ASAHI_GEM_CREATE,      drm_asahi_gem_create,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::gem_create),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_create),
         (ASAHI_GEM_MMAP_OFFSET, drm_asahi_gem_mmap_offset,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::gem_mmap_offset),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_mmap_offset),
         (ASAHI_GEM_BIND,        drm_asahi_gem_bind,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::gem_bind),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_bind),
         (ASAHI_QUEUE_CREATE,    drm_asahi_queue_create,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::queue_create),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::queue_create),
         (ASAHI_QUEUE_DESTROY,   drm_asahi_queue_destroy,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::queue_destroy),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::queue_destroy),
         (ASAHI_SUBMIT,          drm_asahi_submit,
-            ioctl::AUTH | ioctl::RENDER_ALLOW, file::File::submit),
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::submit),
     }
 }
 
@@ -85,6 +85,7 @@ kernel::define_of_id_table! {ASAHI_ID_TABLE, &'static hw::HwConfig, [
     (of::DeviceId::Compatible(b"apple,agx-t6002"), Some(&hw::t600x::HWCONFIG_T6002)),
     (of::DeviceId::Compatible(b"apple,agx-t6020"), Some(&hw::t602x::HWCONFIG_T6020)),
     (of::DeviceId::Compatible(b"apple,agx-t6021"), Some(&hw::t602x::HWCONFIG_T6021)),
+    (of::DeviceId::Compatible(b"apple,agx-t6022"), Some(&hw::t602x::HWCONFIG_T6022)),
 ]}
 
 /// Platform Driver implementation for `AsahiDriver`.
@@ -131,20 +132,21 @@ impl platform::Driver for AsahiDriver {
             (hw::GpuGen::G14, hw::GpuVariant::G, &[12, 4, 0]) => {
                 gpu::GpuManagerG14V12_4::new(reg.device(), &res, cfg)? as Arc<dyn gpu::GpuManager>
             }
-            (hw::GpuGen::G13, _, &[13, 3, 0]) => {
-                gpu::GpuManagerG13V13_3::new(reg.device(), &res, cfg)? as Arc<dyn gpu::GpuManager>
+            (hw::GpuGen::G13, _, &[13, 5, 0]) => {
+                gpu::GpuManagerG13V13_5::new(reg.device(), &res, cfg)? as Arc<dyn gpu::GpuManager>
             }
-            (hw::GpuGen::G14, hw::GpuVariant::G, &[13, 3, 0]) => {
-                gpu::GpuManagerG14V13_3::new(reg.device(), &res, cfg)? as Arc<dyn gpu::GpuManager>
+            (hw::GpuGen::G14, hw::GpuVariant::G, &[13, 5, 0]) => {
+                gpu::GpuManagerG14V13_5::new(reg.device(), &res, cfg)? as Arc<dyn gpu::GpuManager>
             }
-            (hw::GpuGen::G14, _, &[13, 3, 0]) => {
-                gpu::GpuManagerG14XV13_3::new(reg.device(), &res, cfg)? as Arc<dyn gpu::GpuManager>
+            (hw::GpuGen::G14, _, &[13, 5, 0]) => {
+                gpu::GpuManagerG14XV13_5::new(reg.device(), &res, cfg)? as Arc<dyn gpu::GpuManager>
             }
             _ => {
                 dev_info!(
                     dev,
-                    "Unsupported GPU/firmware combination ({:?}, {:?})\n",
+                    "Unsupported GPU/firmware combination ({:?}, {:?}, {:?})\n",
                     cfg.gpu_gen,
+                    cfg.gpu_variant,
                     compat
                 );
                 return Err(ENODEV);

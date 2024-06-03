@@ -84,7 +84,7 @@ done:
 	return sp;
 }
 
-static struct bus_type *bus_get(struct bus_type *bus)
+static const struct bus_type *bus_get(const struct bus_type *bus)
 {
 	struct subsys_private *sp = bus_to_subsys(bus);
 
@@ -233,7 +233,7 @@ static const struct kset_uevent_ops bus_uevent_ops = {
 static ssize_t unbind_store(struct device_driver *drv, const char *buf,
 			    size_t count)
 {
-	struct bus_type *bus = bus_get(drv->bus);
+	const struct bus_type *bus = bus_get(drv->bus);
 	struct device *dev;
 	int err = -ENODEV;
 
@@ -256,7 +256,7 @@ static DRIVER_ATTR_IGNORE_LOCKDEP(unbind, 0200, NULL, unbind_store);
 static ssize_t bind_store(struct device_driver *drv, const char *buf,
 			  size_t count)
 {
-	struct bus_type *bus = bus_get(drv->bus);
+	const struct bus_type *bus = bus_get(drv->bus);
 	struct device *dev;
 	int err = -ENODEV;
 
@@ -274,7 +274,7 @@ static ssize_t bind_store(struct device_driver *drv, const char *buf,
 }
 static DRIVER_ATTR_IGNORE_LOCKDEP(bind, 0200, NULL, bind_store);
 
-static ssize_t drivers_autoprobe_show(struct bus_type *bus, char *buf)
+static ssize_t drivers_autoprobe_show(const struct bus_type *bus, char *buf)
 {
 	struct subsys_private *sp = bus_to_subsys(bus);
 	int ret;
@@ -287,7 +287,7 @@ static ssize_t drivers_autoprobe_show(struct bus_type *bus, char *buf)
 	return ret;
 }
 
-static ssize_t drivers_autoprobe_store(struct bus_type *bus,
+static ssize_t drivers_autoprobe_store(const struct bus_type *bus,
 				       const char *buf, size_t count)
 {
 	struct subsys_private *sp = bus_to_subsys(bus);
@@ -304,7 +304,7 @@ static ssize_t drivers_autoprobe_store(struct bus_type *bus,
 	return count;
 }
 
-static ssize_t drivers_probe_store(struct bus_type *bus,
+static ssize_t drivers_probe_store(const struct bus_type *bus,
 				   const char *buf, size_t count)
 {
 	struct device *dev;
@@ -769,7 +769,7 @@ static int __must_check bus_rescan_devices_helper(struct device *dev,
  * attached and rescan it against existing drivers to see if it matches
  * any by calling device_attach() for the unbound devices.
  */
-int bus_rescan_devices(struct bus_type *bus)
+int bus_rescan_devices(const struct bus_type *bus)
 {
 	return bus_for_each_dev(bus, NULL, NULL, bus_rescan_devices_helper);
 }
@@ -808,7 +808,7 @@ static void klist_devices_put(struct klist_node *n)
 	put_device(dev);
 }
 
-static ssize_t bus_uevent_store(struct bus_type *bus,
+static ssize_t bus_uevent_store(const struct bus_type *bus,
 				const char *buf, size_t count)
 {
 	struct subsys_private *sp = bus_to_subsys(bus);
@@ -841,7 +841,7 @@ static struct bus_attribute bus_attr_uevent = __ATTR(uevent, 0200, NULL,
  * infrastructure, then register the children subsystems it has:
  * the devices and drivers that belong to the subsystem.
  */
-int bus_register(struct bus_type *bus)
+int bus_register(const struct bus_type *bus)
 {
 	int retval;
 	struct subsys_private *priv;
@@ -935,8 +935,8 @@ void bus_unregister(const struct bus_type *bus)
 		return;
 
 	pr_debug("bus: '%s': unregistering\n", bus->name);
-	if (bus->dev_root)
-		device_unregister(bus->dev_root);
+	if (sp->dev_root)
+		device_unregister(sp->dev_root);
 
 	bus_kobj = &sp->subsys.kobj;
 	sysfs_remove_groups(bus_kobj, bus->bus_groups);
@@ -1030,7 +1030,7 @@ static void device_insertion_sort_klist(struct device *a, struct list_head *list
 	list_move_tail(&a->p->knode_bus.n_node, list);
 }
 
-void bus_sort_breadthfirst(struct bus_type *bus,
+void bus_sort_breadthfirst(const struct bus_type *bus,
 			   int (*compare)(const struct device *a,
 					  const struct device *b))
 {
@@ -1194,16 +1194,23 @@ static void system_root_device_release(struct device *dev)
 	kfree(dev);
 }
 
-static int subsys_register(struct bus_type *subsys,
+static int subsys_register(const struct bus_type *subsys,
 			   const struct attribute_group **groups,
 			   struct kobject *parent_of_root)
 {
+	struct subsys_private *sp;
 	struct device *dev;
 	int err;
 
 	err = bus_register(subsys);
 	if (err < 0)
 		return err;
+
+	sp = bus_to_subsys(subsys);
+	if (!sp) {
+		err = -EINVAL;
+		goto err_sp;
+	}
 
 	dev = kzalloc(sizeof(struct device), GFP_KERNEL);
 	if (!dev) {
@@ -1223,7 +1230,8 @@ static int subsys_register(struct bus_type *subsys,
 	if (err < 0)
 		goto err_dev_reg;
 
-	subsys->dev_root = dev;
+	sp->dev_root = dev;
+	subsys_put(sp);
 	return 0;
 
 err_dev_reg:
@@ -1232,6 +1240,8 @@ err_dev_reg:
 err_name:
 	kfree(dev);
 err_dev:
+	subsys_put(sp);
+err_sp:
 	bus_unregister(subsys);
 	return err;
 }
@@ -1254,7 +1264,7 @@ err_dev:
  * directory itself and not some create fake root-device placed in
  * /sys/devices/system/<name>.
  */
-int subsys_system_register(struct bus_type *subsys,
+int subsys_system_register(const struct bus_type *subsys,
 			   const struct attribute_group **groups)
 {
 	return subsys_register(subsys, groups, &system_kset->kobj);
@@ -1272,7 +1282,7 @@ EXPORT_SYMBOL_GPL(subsys_system_register);
  * There's no restriction on device naming.  This is for kernel software
  * constructs which need sysfs interface.
  */
-int subsys_virtual_register(struct bus_type *subsys,
+int subsys_virtual_register(const struct bus_type *subsys,
 			    const struct attribute_group **groups)
 {
 	struct kobject *virtual_dir;
@@ -1297,7 +1307,7 @@ EXPORT_SYMBOL_GPL(subsys_virtual_register);
  * from being unregistered or unloaded while the caller is using it.
  * The caller is responsible for preventing this.
  */
-struct device_driver *driver_find(const char *name, struct bus_type *bus)
+struct device_driver *driver_find(const char *name, const struct bus_type *bus)
 {
 	struct subsys_private *sp = bus_to_subsys(bus);
 	struct kobject *k;
@@ -1349,9 +1359,15 @@ bool bus_is_registered(const struct bus_type *bus)
  */
 struct device *bus_get_dev_root(const struct bus_type *bus)
 {
-	if (bus)
-		return get_device(bus->dev_root);
-	return NULL;
+	struct subsys_private *sp = bus_to_subsys(bus);
+	struct device *dev_root;
+
+	if (!sp)
+		return NULL;
+
+	dev_root = get_device(sp->dev_root);
+	subsys_put(sp);
+	return dev_root;
 }
 EXPORT_SYMBOL_GPL(bus_get_dev_root);
 

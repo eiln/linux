@@ -2339,8 +2339,7 @@ static int drm_mode_parse_cmdline_named_mode(const char *name,
  * @mode: preallocated drm_cmdline_mode structure to fill out
  *
  * This parses @mode_option command line modeline for modes and options to
- * configure the connector. If @mode_option is NULL the default command line
- * modeline in fb_mode_option will be parsed instead.
+ * configure the connector.
  *
  * This uses the same parameters as the fb modedb.c, except for an extra
  * force-enable, force-enable-digital and force-disable bit at the end::
@@ -2618,8 +2617,7 @@ void drm_mode_convert_to_umode(struct drm_mode_modeinfo *out,
 		break;
 	}
 
-	strncpy(out->name, in->name, DRM_DISPLAY_MODE_LEN);
-	out->name[DRM_DISPLAY_MODE_LEN-1] = 0;
+	strscpy_pad(out->name, in->name, sizeof(out->name));
 }
 
 /**
@@ -2660,8 +2658,7 @@ int drm_mode_convert_umode(struct drm_device *dev,
 	 * useful for the kernel->userspace direction anyway.
 	 */
 	out->type = in->type & DRM_MODE_TYPE_ALL;
-	strncpy(out->name, in->name, DRM_DISPLAY_MODE_LEN);
-	out->name[DRM_DISPLAY_MODE_LEN-1] = 0;
+	strscpy_pad(out->name, in->name, sizeof(out->name));
 
 	/* Clearing picture aspect ratio bits from out flags,
 	 * as the aspect-ratio information is not stored in

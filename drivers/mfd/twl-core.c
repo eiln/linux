@@ -31,6 +31,8 @@
 #include <linux/regulator/machine.h>
 
 #include <linux/i2c.h>
+
+#include <linux/mfd/core.h>
 #include <linux/mfd/twl.h>
 
 /* Register descriptions for audio */
@@ -312,7 +314,7 @@ static const struct regmap_config twl4030_regmap_config[4] = {
 
 		.reg_defaults = twl4030_49_defaults,
 		.num_reg_defaults = ARRAY_SIZE(twl4030_49_defaults),
-		.cache_type = REGCACHE_RBTREE,
+		.cache_type = REGCACHE_MAPLE,
 	},
 	{
 		/* Address 0x4a */
@@ -594,71 +596,6 @@ int twl_get_hfclk_rate(void)
 }
 EXPORT_SYMBOL_GPL(twl_get_hfclk_rate);
 
-static struct device *
-add_numbered_child(unsigned mod_no, const char *name, int num,
-		void *pdata, unsigned pdata_len,
-		bool can_wakeup, int irq0, int irq1)
-{
-	struct platform_device	*pdev;
-	struct twl_client	*twl;
-	int			status, sid;
-
-	if (unlikely(mod_no >= twl_get_last_module())) {
-		pr_err("%s: invalid module number %d\n", DRIVER_NAME, mod_no);
-		return ERR_PTR(-EPERM);
-	}
-	sid = twl_priv->twl_map[mod_no].sid;
-	twl = &twl_priv->twl_modules[sid];
-
-	pdev = platform_device_alloc(name, num);
-	if (!pdev)
-		return ERR_PTR(-ENOMEM);
-
-	pdev->dev.parent = &twl->client->dev;
-
-	if (pdata) {
-		status = platform_device_add_data(pdev, pdata, pdata_len);
-		if (status < 0) {
-			dev_dbg(&pdev->dev, "can't add platform_data\n");
-			goto put_device;
-		}
-	}
-
-	if (irq0) {
-		struct resource r[2] = {
-			{ .start = irq0, .flags = IORESOURCE_IRQ, },
-			{ .start = irq1, .flags = IORESOURCE_IRQ, },
-		};
-
-		status = platform_device_add_resources(pdev, r, irq1 ? 2 : 1);
-		if (status < 0) {
-			dev_dbg(&pdev->dev, "can't add irqs\n");
-			goto put_device;
-		}
-	}
-
-	status = platform_device_add(pdev);
-	if (status)
-		goto put_device;
-
-	device_init_wakeup(&pdev->dev, can_wakeup);
-
-	return &pdev->dev;
-
-put_device:
-	platform_device_put(pdev);
-	dev_err(&twl->client->dev, "failed to add device %s\n", name);
-	return ERR_PTR(status);
-}
-
-static inline struct device *add_child(unsigned mod_no, const char *name,
-		void *pdata, unsigned pdata_len,
-		bool can_wakeup, int irq0, int irq1)
-{
-	return add_numbered_child(mod_no, name, -1, pdata, pdata_len,
-		can_wakeup, irq0, irq1);
-}
-
 /*----------------------------------------------------------------------*/
 
 /*
@@ -753,6 +690,10 @@ static void twl_remove(struct i2c_client *client)
 static struct of_dev_auxdata twl_auxdata_lookup[] = {
 	OF_DEV_AUXDATA("ti,twl4030-gpio", 0, "twl4030-gpio", NULL),
 	{ /* sentinel */ },
+};
+
+static const struct mfd_cell twl6032_cells[] = {
+	{ .name = "twl6032-clk" },
 };
 
 /* NOTE: This driver only handles a single twl4030/tps659x0 chip */
@@ -901,6 +842,16 @@ twl_probe(struct i2c_client *client)
 				 TWL4030_DCDC_GLOBAL_CFG);
 	}
 
+	if (id->driver_data == (TWL6030_CLASS | TWL6032_SUBCLASS)) {
+		status = devm_mfd_add_devices(&client->dev,
+					      PLATFORM_DEVID_NONE,
+					      twl6032_cells,
+					      ARRAY_SIZE(twl6032_cells),
+					      NULL, 0, NULL);
+		if (status < 0)
+			goto free;
+	}
+
 	status = of_platform_populate(node, NULL, twl_auxdata_lookup,
 				      &client->dev);
 
@@ -955,7 +906,7 @@ static struct i2c_driver twl_driver = {
 	.driver.name	= DRIVER_NAME,
 	.driver.pm	= &twl_dev_pm_ops,
 	.id_table	= twl_ids,
-	.probe_new	= twl_probe,
+	.probe		= twl_probe,
 	.remove		= twl_remove,
 };
 builtin_i2c_driver(twl_driver);

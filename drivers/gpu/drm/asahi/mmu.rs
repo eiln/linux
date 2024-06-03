@@ -28,7 +28,7 @@ use kernel::{
         lock::{mutex::MutexBackend, Guard},
         Arc, Mutex,
     },
-    time,
+    time::{clock, Now},
     types::ForeignOwnable,
 };
 
@@ -75,10 +75,6 @@ const IOVA_USER_TOP: usize = (1 << UAT_IAS) - 1;
 const IOVA_KERN_BASE: usize = 0xffffffa000000000;
 /// Driver-managed kernel top VA
 const IOVA_KERN_TOP: usize = 0xffffffafffffffff;
-
-/// Range reserved for MMIO maps
-const IOVA_KERN_MMIO_BASE: usize = 0xffffffaf00000000;
-const IOVA_KERN_MMIO_TOP: usize = 0xffffffafffffffff;
 
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
@@ -675,10 +671,11 @@ impl Handoff {
         self.unk3.store(0, Ordering::Relaxed);
         fence(Ordering::SeqCst);
 
-        let timeout = time::ktime_get() + Duration::from_millis(1000);
+        let start = clock::KernelTime::now();
+        const TIMEOUT: Duration = Duration::from_millis(1000);
 
         self.lock();
-        while time::ktime_get() < timeout {
+        while start.elapsed() < TIMEOUT {
             if self.magic_fw.load(Ordering::Relaxed) == PPL_MAGIC {
                 break;
             } else {
@@ -822,26 +819,6 @@ impl Vm {
         self.inner.lock().ttb()
     }
 
-    /// Map a GEM object (using its `SGTable`) into this Vm at a free address.
-    pub(crate) fn map(&self, size: usize, sgt: gem::SGTable) -> Result<Mapping> {
-        let mut inner = self.inner.lock();
-
-        let uat_inner = inner.uat_inner.clone();
-        let node = inner.mm.insert_node(
-            MappingInner {
-                owner: self.inner.clone(),
-                uat_inner,
-                prot: PROT_FW_SHARED_RW,
-                sgt: Some(sgt),
-                mapped_size: size,
-            },
-            (size + UAT_PGSZ) as u64, // Add guard page
-        )?;
-
-        inner.map_node(&node, PROT_FW_SHARED_RW)?;
-        Ok(Mapping(node))
-    }
-
     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_in_range(
@@ -908,29 +885,10 @@ impl Vm {
     }
 
     /// Add a direct MMIO mapping to this Vm at a free address.
-    pub(crate) fn map_io(&self, phys: usize, size: usize, prot: u32) -> Result<Mapping> {
+    pub(crate) fn map_io(&self, iova: u64, phys: usize, size: usize, prot: u32) -> Result<Mapping> {
         let mut inner = self.inner.lock();
 
-        let uat_inner = inner.uat_inner.clone();
-        let node = inner.mm.insert_node_in_range(
-            MappingInner {
-                owner: self.inner.clone(),
-                uat_inner,
-                prot,
-                sgt: None,
-                mapped_size: size,
-            },
-            (size + UAT_PGSZ) as u64, // Add guard page
-            UAT_PGSZ as u64,
-            0,
-            IOVA_KERN_MMIO_BASE as u64,
-            IOVA_KERN_MMIO_TOP as u64,
-            mm::InsertMode::Best,
-        )?;
-
-        let iova = node.start() as usize;
-
-        if (phys | size | iova) & UAT_PGMSK != 0 {
+        if (iova as usize | phys | size) & UAT_PGMSK != 0 {
             dev_err!(
                 inner.dev,
                 "MMU: Mapping {:#x}:{:#x} -> {:#x} is not page-aligned\n",
@@ -949,7 +907,21 @@ impl Vm {
             iova
         );
 
-        inner.map_pages(iova, phys, UAT_PGSZ, size >> UAT_PGBIT, prot)?;
+        let uat_inner = inner.uat_inner.clone();
+        let node = inner.mm.reserve_node(
+            MappingInner {
+                owner: self.inner.clone(),
+                uat_inner,
+                prot,
+                sgt: None,
+                mapped_size: size,
+            },
+            iova,
+            size as u64,
+            0,
+        )?;
+
+        inner.map_pages(iova as usize, phys, UAT_PGSZ, size >> UAT_PGBIT, prot)?;
 
         Ok(Mapping(node))
     }
@@ -1043,6 +1015,7 @@ impl Uat {
                 return Err(EINVAL);
             }
             let ret = bindings::of_address_to_resource(np, 0, res.as_mut_ptr());
+            #[cfg(CONFIG_OF_DYNAMIC)]
             bindings::of_node_put(np);
 
             if ret < 0 {
@@ -1222,7 +1195,7 @@ impl Uat {
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
                 (),
-                |_inner, _slot| SlotInner(),
+                |_inner, _slot| Some(SlotInner()),
                 c_str!("Uat::SlotAllocator"),
                 static_lock_class!(),
                 static_lock_class!(),

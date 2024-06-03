@@ -332,8 +332,8 @@ static int mlx5r_umr_post_send_wait(struct mlx5_ib_dev *dev, u32 mkey,
 
 		WARN_ON_ONCE(1);
 		mlx5_ib_warn(dev,
-			"reg umr failed (%u). Trying to recover and resubmit the flushed WQEs\n",
-			umr_context.status);
+			"reg umr failed (%u). Trying to recover and resubmit the flushed WQEs, mkey = %u\n",
+			umr_context.status, mkey);
 		mutex_lock(&umrc->lock);
 		err = mlx5r_umr_recover(dev);
 		mutex_unlock(&umrc->lock);
@@ -380,6 +380,10 @@ static void mlx5r_umr_set_access_flags(struct mlx5_ib_dev *dev,
 				       struct mlx5_mkey_seg *seg,
 				       unsigned int access_flags)
 {
+	bool ro_read = (access_flags & IB_ACCESS_RELAXED_ORDERING) &&
+		       (MLX5_CAP_GEN(dev->mdev, relaxed_ordering_read) ||
+			pcie_relaxed_ordering_enabled(dev->mdev->pdev));
+
 	MLX5_SET(mkc, seg, a, !!(access_flags & IB_ACCESS_REMOTE_ATOMIC));
 	MLX5_SET(mkc, seg, rw, !!(access_flags & IB_ACCESS_REMOTE_WRITE));
 	MLX5_SET(mkc, seg, rr, !!(access_flags & IB_ACCESS_REMOTE_READ));
@@ -387,8 +391,7 @@ static void mlx5r_umr_set_access_flags(struct mlx5_ib_dev *dev,
 	MLX5_SET(mkc, seg, lr, 1);
 	MLX5_SET(mkc, seg, relaxed_ordering_write,
 		 !!(access_flags & IB_ACCESS_RELAXED_ORDERING));
-	MLX5_SET(mkc, seg, relaxed_ordering_read,
-		 !!(access_flags & IB_ACCESS_RELAXED_ORDERING));
+	MLX5_SET(mkc, seg, relaxed_ordering_read, ro_read);
 }
 
 int mlx5r_umr_rereg_pd_access(struct mlx5_ib_mr *mr, struct ib_pd *pd,

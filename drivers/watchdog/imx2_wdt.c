@@ -26,8 +26,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/watchdog.h>
@@ -375,7 +374,7 @@ static void imx2_wdt_shutdown(struct platform_device *pdev)
 		 */
 		imx2_wdt_set_timeout(wdog, IMX2_WDT_MAX_TIME);
 		imx2_wdt_ping(wdog);
-		dev_crit(&pdev->dev, "Device shutdown: Expect reboot!\n");
+		dev_crit(&pdev->dev, "Device shutdown.\n");
 	}
 }
 
@@ -439,11 +438,11 @@ static int __maybe_unused imx2_wdt_resume(struct device *dev)
 static SIMPLE_DEV_PM_OPS(imx2_wdt_pm_ops, imx2_wdt_suspend,
 			 imx2_wdt_resume);
 
-struct imx2_wdt_data imx_wdt = {
+static struct imx2_wdt_data imx_wdt = {
 	.wdw_supported = true,
 };
 
-struct imx2_wdt_data imx_wdt_legacy = {
+static struct imx2_wdt_data imx_wdt_legacy = {
 	.wdw_supported = false,
 };
 

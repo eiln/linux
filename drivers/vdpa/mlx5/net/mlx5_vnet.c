@@ -7,6 +7,7 @@
 #include <uapi/linux/virtio_net.h>
 #include <uapi/linux/virtio_ids.h>
 #include <uapi/linux/vdpa.h>
+#include <uapi/linux/vhost_types.h>
 #include <linux/virtio_config.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/mlx5/cq.h>
@@ -83,6 +84,7 @@ struct mlx5_vq_restore_info {
 	u64 driver_addr;
 	u16 avail_index;
 	u16 used_index;
+	struct msi_map map;
 	bool ready;
 	bool restore;
 };
@@ -118,6 +120,13 @@ struct mlx5_vdpa_virtqueue {
 	u16 avail_idx;
 	u16 used_idx;
 	int fw_state;
+
+	u64 modified_fields;
+
+	struct mlx5_vdpa_mr *vq_mr;
+	struct mlx5_vdpa_mr *desc_mr;
+
+	struct msi_map map;
 
 	/* keep last in the struct */
 	struct mlx5_vq_restore_info ri;
@@ -578,7 +587,7 @@ static int cq_create(struct mlx5_vdpa_net *ndev, u16 idx, u32 num_ent)
 	/* Use vector 0 by default. Consider adding code to choose least used
 	 * vector.
 	 */
-	err = mlx5_vector2eqn(mdev, 0, &eqn);
+	err = mlx5_comp_eqn_get(mdev, 0, &eqn);
 	if (err)
 		goto err_vec;
 
@@ -623,30 +632,70 @@ static void cq_destroy(struct mlx5_vdpa_net *ndev, u16 idx)
 	mlx5_db_free(ndev->mvdev.mdev, &vcq->db);
 }
 
+static int read_umem_params(struct mlx5_vdpa_net *ndev)
+{
+	u32 in[MLX5_ST_SZ_DW(query_hca_cap_in)] = {};
+	u16 opmod = (MLX5_CAP_VDPA_EMULATION << 1) | (HCA_CAP_OPMOD_GET_CUR & 0x01);
+	struct mlx5_core_dev *mdev = ndev->mvdev.mdev;
+	int out_size;
+	void *caps;
+	void *out;
+	int err;
+
+	out_size = MLX5_ST_SZ_BYTES(query_hca_cap_out);
+	out = kzalloc(out_size, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	MLX5_SET(query_hca_cap_in, in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
+	MLX5_SET(query_hca_cap_in, in, op_mod, opmod);
+	err = mlx5_cmd_exec_inout(mdev, query_hca_cap, in, out);
+	if (err) {
+		mlx5_vdpa_warn(&ndev->mvdev,
+			"Failed reading vdpa umem capabilities with err %d\n", err);
+		goto out;
+	}
+
+	caps =  MLX5_ADDR_OF(query_hca_cap_out, out, capability);
+
+	ndev->umem_1_buffer_param_a = MLX5_GET(virtio_emulation_cap, caps, umem_1_buffer_param_a);
+	ndev->umem_1_buffer_param_b = MLX5_GET(virtio_emulation_cap, caps, umem_1_buffer_param_b);
+
+	ndev->umem_2_buffer_param_a = MLX5_GET(virtio_emulation_cap, caps, umem_2_buffer_param_a);
+	ndev->umem_2_buffer_param_b = MLX5_GET(virtio_emulation_cap, caps, umem_2_buffer_param_b);
+
+	ndev->umem_3_buffer_param_a = MLX5_GET(virtio_emulation_cap, caps, umem_3_buffer_param_a);
+	ndev->umem_3_buffer_param_b = MLX5_GET(virtio_emulation_cap, caps, umem_3_buffer_param_b);
+
+out:
+	kfree(out);
+	return 0;
+}
+
 static void set_umem_size(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq, int num,
 			  struct mlx5_vdpa_umem **umemp)
 {
-	struct mlx5_core_dev *mdev = ndev->mvdev.mdev;
-	int p_a;
-	int p_b;
+	u32 p_a;
+	u32 p_b;
 
 	switch (num) {
 	case 1:
-		p_a = MLX5_CAP_DEV_VDPA_EMULATION(mdev, umem_1_buffer_param_a);
-		p_b = MLX5_CAP_DEV_VDPA_EMULATION(mdev, umem_1_buffer_param_b);
+		p_a = ndev->umem_1_buffer_param_a;
+		p_b = ndev->umem_1_buffer_param_b;
 		*umemp = &mvq->umem1;
 		break;
 	case 2:
-		p_a = MLX5_CAP_DEV_VDPA_EMULATION(mdev, umem_2_buffer_param_a);
-		p_b = MLX5_CAP_DEV_VDPA_EMULATION(mdev, umem_2_buffer_param_b);
+		p_a = ndev->umem_2_buffer_param_a;
+		p_b = ndev->umem_2_buffer_param_b;
 		*umemp = &mvq->umem2;
 		break;
 	case 3:
-		p_a = MLX5_CAP_DEV_VDPA_EMULATION(mdev, umem_3_buffer_param_a);
-		p_b = MLX5_CAP_DEV_VDPA_EMULATION(mdev, umem_3_buffer_param_b);
+		p_a = ndev->umem_3_buffer_param_a;
+		p_b = ndev->umem_3_buffer_param_b;
 		*umemp = &mvq->umem3;
 		break;
 	}
+
 	(*umemp)->size = p_a * mvq->num_ent + p_b;
 }
 
@@ -778,12 +827,28 @@ static bool vq_is_tx(u16 idx)
 	return idx % 2;
 }
 
-static u16 get_features_12_3(u64 features)
+enum {
+	MLX5_VIRTIO_NET_F_MRG_RXBUF = 2,
+	MLX5_VIRTIO_NET_F_HOST_ECN = 4,
+	MLX5_VIRTIO_NET_F_GUEST_ECN = 6,
+	MLX5_VIRTIO_NET_F_GUEST_TSO6 = 7,
+	MLX5_VIRTIO_NET_F_GUEST_TSO4 = 8,
+	MLX5_VIRTIO_NET_F_GUEST_CSUM = 9,
+	MLX5_VIRTIO_NET_F_CSUM = 10,
+	MLX5_VIRTIO_NET_F_HOST_TSO6 = 11,
+	MLX5_VIRTIO_NET_F_HOST_TSO4 = 12,
+};
+
+static u16 get_features(u64 features)
 {
-	return (!!(features & BIT_ULL(VIRTIO_NET_F_HOST_TSO4)) << 9) |
-	       (!!(features & BIT_ULL(VIRTIO_NET_F_HOST_TSO6)) << 8) |
-	       (!!(features & BIT_ULL(VIRTIO_NET_F_CSUM)) << 7) |
-	       (!!(features & BIT_ULL(VIRTIO_NET_F_GUEST_CSUM)) << 6);
+	return (!!(features & BIT_ULL(VIRTIO_NET_F_MRG_RXBUF)) << MLX5_VIRTIO_NET_F_MRG_RXBUF) |
+	       (!!(features & BIT_ULL(VIRTIO_NET_F_HOST_ECN)) << MLX5_VIRTIO_NET_F_HOST_ECN) |
+	       (!!(features & BIT_ULL(VIRTIO_NET_F_GUEST_ECN)) << MLX5_VIRTIO_NET_F_GUEST_ECN) |
+	       (!!(features & BIT_ULL(VIRTIO_NET_F_GUEST_TSO6)) << MLX5_VIRTIO_NET_F_GUEST_TSO6) |
+	       (!!(features & BIT_ULL(VIRTIO_NET_F_GUEST_TSO4)) << MLX5_VIRTIO_NET_F_GUEST_TSO4) |
+	       (!!(features & BIT_ULL(VIRTIO_NET_F_CSUM)) << MLX5_VIRTIO_NET_F_CSUM) |
+	       (!!(features & BIT_ULL(VIRTIO_NET_F_HOST_TSO6)) << MLX5_VIRTIO_NET_F_HOST_TSO6) |
+	       (!!(features & BIT_ULL(VIRTIO_NET_F_HOST_TSO4)) << MLX5_VIRTIO_NET_F_HOST_TSO4);
 }
 
 static bool counters_supported(const struct mlx5_vdpa_dev *mvdev)
@@ -792,11 +857,22 @@ static bool counters_supported(const struct mlx5_vdpa_dev *mvdev)
 	       BIT_ULL(MLX5_OBJ_TYPE_VIRTIO_Q_COUNTERS);
 }
 
+static bool msix_mode_supported(struct mlx5_vdpa_dev *mvdev)
+{
+	return MLX5_CAP_DEV_VDPA_EMULATION(mvdev->mdev, event_mode) &
+		(1 << MLX5_VIRTIO_Q_EVENT_MODE_MSIX_MODE) &&
+		pci_msix_can_alloc_dyn(mvdev->mdev->pdev);
+}
+
 static int create_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
 {
 	int inlen = MLX5_ST_SZ_BYTES(create_virtio_net_q_in);
 	u32 out[MLX5_ST_SZ_DW(create_virtio_net_q_out)] = {};
+	struct mlx5_vdpa_dev *mvdev = &ndev->mvdev;
+	struct mlx5_vdpa_mr *vq_mr;
+	struct mlx5_vdpa_mr *vq_desc_mr;
 	void *obj_context;
+	u16 mlx_features;
 	void *cmd_hdr;
 	void *vq_ctx;
 	void *in;
@@ -812,6 +888,7 @@ static int create_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtque
 		goto err_alloc;
 	}
 
+	mlx_features = get_features(ndev->mvdev.actual_features);
 	cmd_hdr = MLX5_ADDR_OF(create_virtio_net_q_in, in, general_obj_in_cmd_hdr);
 
 	MLX5_SET(general_obj_in_cmd_hdr, cmd_hdr, opcode, MLX5_CMD_OP_CREATE_GENERAL_OBJECT);
@@ -822,23 +899,38 @@ static int create_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtque
 	MLX5_SET(virtio_net_q_object, obj_context, hw_available_index, mvq->avail_idx);
 	MLX5_SET(virtio_net_q_object, obj_context, hw_used_index, mvq->used_idx);
 	MLX5_SET(virtio_net_q_object, obj_context, queue_feature_bit_mask_12_3,
-		 get_features_12_3(ndev->mvdev.actual_features));
+		 mlx_features >> 3);
+	MLX5_SET(virtio_net_q_object, obj_context, queue_feature_bit_mask_2_0,
+		 mlx_features & 7);
 	vq_ctx = MLX5_ADDR_OF(virtio_net_q_object, obj_context, virtio_q_context);
 	MLX5_SET(virtio_q, vq_ctx, virtio_q_type, get_queue_type(ndev));
 
 	if (vq_is_tx(mvq->index))
 		MLX5_SET(virtio_net_q_object, obj_context, tisn_or_qpn, ndev->res.tisn);
 
-	MLX5_SET(virtio_q, vq_ctx, event_mode, MLX5_VIRTIO_Q_EVENT_MODE_QP_MODE);
+	if (mvq->map.virq) {
+		MLX5_SET(virtio_q, vq_ctx, event_mode, MLX5_VIRTIO_Q_EVENT_MODE_MSIX_MODE);
+		MLX5_SET(virtio_q, vq_ctx, event_qpn_or_msix, mvq->map.index);
+	} else {
+		MLX5_SET(virtio_q, vq_ctx, event_mode, MLX5_VIRTIO_Q_EVENT_MODE_QP_MODE);
+		MLX5_SET(virtio_q, vq_ctx, event_qpn_or_msix, mvq->fwqp.mqp.qpn);
+	}
+
 	MLX5_SET(virtio_q, vq_ctx, queue_index, mvq->index);
-	MLX5_SET(virtio_q, vq_ctx, event_qpn_or_msix, mvq->fwqp.mqp.qpn);
 	MLX5_SET(virtio_q, vq_ctx, queue_size, mvq->num_ent);
 	MLX5_SET(virtio_q, vq_ctx, virtio_version_1_0,
 		 !!(ndev->mvdev.actual_features & BIT_ULL(VIRTIO_F_VERSION_1)));
 	MLX5_SET64(virtio_q, vq_ctx, desc_addr, mvq->desc_addr);
 	MLX5_SET64(virtio_q, vq_ctx, used_addr, mvq->device_addr);
 	MLX5_SET64(virtio_q, vq_ctx, available_addr, mvq->driver_addr);
-	MLX5_SET(virtio_q, vq_ctx, virtio_q_mkey, ndev->mvdev.mr.mkey);
+	vq_mr = mvdev->mr[mvdev->group2asid[MLX5_VDPA_DATAVQ_GROUP]];
+	if (vq_mr)
+		MLX5_SET(virtio_q, vq_ctx, virtio_q_mkey, vq_mr->mkey);
+
+	vq_desc_mr = mvdev->mr[mvdev->group2asid[MLX5_VDPA_DATAVQ_DESC_GROUP]];
+	if (vq_desc_mr && MLX5_CAP_DEV_VDPA_EMULATION(mvdev->mdev, desc_group_mkey_supported))
+		MLX5_SET(virtio_q, vq_ctx, desc_group_mkey, vq_desc_mr->mkey);
+
 	MLX5_SET(virtio_q, vq_ctx, umem_1_id, mvq->umem1.id);
 	MLX5_SET(virtio_q, vq_ctx, umem_1_size, mvq->umem1.size);
 	MLX5_SET(virtio_q, vq_ctx, umem_2_id, mvq->umem2.id);
@@ -856,6 +948,14 @@ static int create_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtque
 	mvq->fw_state = MLX5_VIRTIO_NET_Q_OBJECT_STATE_INIT;
 	kfree(in);
 	mvq->virtq_id = MLX5_GET(general_obj_out_cmd_hdr, out, obj_id);
+
+	mlx5_vdpa_get_mr(mvdev, vq_mr);
+	mvq->vq_mr = vq_mr;
+
+	if (vq_desc_mr && MLX5_CAP_DEV_VDPA_EMULATION(mvdev->mdev, desc_group_mkey_supported)) {
+		mlx5_vdpa_get_mr(mvdev, vq_desc_mr);
+		mvq->desc_mr = vq_desc_mr;
+	}
 
 	return 0;
 
@@ -883,6 +983,12 @@ static void destroy_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtq
 	}
 	mvq->fw_state = MLX5_VIRTIO_NET_Q_OBJECT_NONE;
 	umems_destroy(ndev, mvq);
+
+	mlx5_vdpa_put_mr(&ndev->mvdev, mvq->vq_mr);
+	mvq->vq_mr = NULL;
+
+	mlx5_vdpa_put_mr(&ndev->mvdev, mvq->desc_mr);
+	mvq->desc_mr = NULL;
 }
 
 static u32 get_rqpn(struct mlx5_vdpa_virtqueue *mvq, bool fw)
@@ -1081,7 +1187,12 @@ err_cmd:
 	return err;
 }
 
-static bool is_valid_state_change(int oldstate, int newstate)
+static bool is_resumable(struct mlx5_vdpa_net *ndev)
+{
+	return ndev->mvdev.vdev.config->resume;
+}
+
+static bool is_valid_state_change(int oldstate, int newstate, bool resumable)
 {
 	switch (oldstate) {
 	case MLX5_VIRTIO_NET_Q_OBJECT_STATE_INIT:
@@ -1089,25 +1200,43 @@ static bool is_valid_state_change(int oldstate, int newstate)
 	case MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY:
 		return newstate == MLX5_VIRTIO_NET_Q_OBJECT_STATE_SUSPEND;
 	case MLX5_VIRTIO_NET_Q_OBJECT_STATE_SUSPEND:
+		return resumable ? newstate == MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY : false;
 	case MLX5_VIRTIO_NET_Q_OBJECT_STATE_ERR:
 	default:
 		return false;
 	}
 }
 
-static int modify_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq, int state)
+static bool modifiable_virtqueue_fields(struct mlx5_vdpa_virtqueue *mvq)
+{
+	/* Only state is always modifiable */
+	if (mvq->modified_fields & ~MLX5_VIRTQ_MODIFY_MASK_STATE)
+		return mvq->fw_state == MLX5_VIRTIO_NET_Q_OBJECT_STATE_INIT ||
+		       mvq->fw_state == MLX5_VIRTIO_NET_Q_OBJECT_STATE_SUSPEND;
+
+	return true;
+}
+
+static int modify_virtqueue(struct mlx5_vdpa_net *ndev,
+			    struct mlx5_vdpa_virtqueue *mvq,
+			    int state)
 {
 	int inlen = MLX5_ST_SZ_BYTES(modify_virtio_net_q_in);
 	u32 out[MLX5_ST_SZ_DW(modify_virtio_net_q_out)] = {};
+	struct mlx5_vdpa_dev *mvdev = &ndev->mvdev;
+	struct mlx5_vdpa_mr *desc_mr = NULL;
+	struct mlx5_vdpa_mr *vq_mr = NULL;
+	bool state_change = false;
 	void *obj_context;
 	void *cmd_hdr;
+	void *vq_ctx;
 	void *in;
 	int err;
 
 	if (mvq->fw_state == MLX5_VIRTIO_NET_Q_OBJECT_NONE)
 		return 0;
 
-	if (!is_valid_state_change(mvq->fw_state, state))
+	if (!modifiable_virtqueue_fields(mvq))
 		return -EINVAL;
 
 	in = kzalloc(inlen, GFP_KERNEL);
@@ -1122,15 +1251,81 @@ static int modify_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtque
 	MLX5_SET(general_obj_in_cmd_hdr, cmd_hdr, uid, ndev->mvdev.res.uid);
 
 	obj_context = MLX5_ADDR_OF(modify_virtio_net_q_in, in, obj_context);
-	MLX5_SET64(virtio_net_q_object, obj_context, modify_field_select,
-		   MLX5_VIRTQ_MODIFY_MASK_STATE);
-	MLX5_SET(virtio_net_q_object, obj_context, state, state);
+	vq_ctx = MLX5_ADDR_OF(virtio_net_q_object, obj_context, virtio_q_context);
+
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_STATE) {
+		if (!is_valid_state_change(mvq->fw_state, state, is_resumable(ndev))) {
+			err = -EINVAL;
+			goto done;
+		}
+
+		MLX5_SET(virtio_net_q_object, obj_context, state, state);
+		state_change = true;
+	}
+
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_ADDRS) {
+		MLX5_SET64(virtio_q, vq_ctx, desc_addr, mvq->desc_addr);
+		MLX5_SET64(virtio_q, vq_ctx, used_addr, mvq->device_addr);
+		MLX5_SET64(virtio_q, vq_ctx, available_addr, mvq->driver_addr);
+	}
+
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_AVAIL_IDX)
+		MLX5_SET(virtio_net_q_object, obj_context, hw_available_index, mvq->avail_idx);
+
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_USED_IDX)
+		MLX5_SET(virtio_net_q_object, obj_context, hw_used_index, mvq->used_idx);
+
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_MKEY) {
+		vq_mr = mvdev->mr[mvdev->group2asid[MLX5_VDPA_DATAVQ_GROUP]];
+
+		if (vq_mr)
+			MLX5_SET(virtio_q, vq_ctx, virtio_q_mkey, vq_mr->mkey);
+		else
+			mvq->modified_fields &= ~MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_MKEY;
+	}
+
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_DESC_GROUP_MKEY) {
+		desc_mr = mvdev->mr[mvdev->group2asid[MLX5_VDPA_DATAVQ_DESC_GROUP]];
+
+		if (desc_mr && MLX5_CAP_DEV_VDPA_EMULATION(mvdev->mdev, desc_group_mkey_supported))
+			MLX5_SET(virtio_q, vq_ctx, desc_group_mkey, desc_mr->mkey);
+		else
+			mvq->modified_fields &= ~MLX5_VIRTQ_MODIFY_MASK_DESC_GROUP_MKEY;
+	}
+
+	MLX5_SET64(virtio_net_q_object, obj_context, modify_field_select, mvq->modified_fields);
 	err = mlx5_cmd_exec(ndev->mvdev.mdev, in, inlen, out, sizeof(out));
-	kfree(in);
-	if (!err)
+	if (err)
+		goto done;
+
+	if (state_change)
 		mvq->fw_state = state;
 
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_MKEY) {
+		mlx5_vdpa_put_mr(mvdev, mvq->vq_mr);
+		mlx5_vdpa_get_mr(mvdev, vq_mr);
+		mvq->vq_mr = vq_mr;
+	}
+
+	if (mvq->modified_fields & MLX5_VIRTQ_MODIFY_MASK_DESC_GROUP_MKEY) {
+		mlx5_vdpa_put_mr(mvdev, mvq->desc_mr);
+		mlx5_vdpa_get_mr(mvdev, desc_mr);
+		mvq->desc_mr = desc_mr;
+	}
+
+	mvq->modified_fields = 0;
+
+done:
+	kfree(in);
 	return err;
+}
+
+static int modify_virtqueue_state(struct mlx5_vdpa_net *ndev,
+				  struct mlx5_vdpa_virtqueue *mvq,
+				  unsigned int state)
+{
+	mvq->modified_fields |= MLX5_VIRTQ_MODIFY_MASK_STATE;
+	return modify_virtqueue(ndev, mvq, state);
 }
 
 static int counter_set_alloc(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
@@ -1174,6 +1369,56 @@ static void counter_set_dealloc(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_vir
 		mlx5_vdpa_warn(&ndev->mvdev, "dealloc counter set 0x%x\n", mvq->counter_set_id);
 }
 
+static irqreturn_t mlx5_vdpa_int_handler(int irq, void *priv)
+{
+	struct vdpa_callback *cb = priv;
+
+	if (cb->callback)
+		return cb->callback(cb->private);
+
+	return IRQ_HANDLED;
+}
+
+static void alloc_vector(struct mlx5_vdpa_net *ndev,
+			 struct mlx5_vdpa_virtqueue *mvq)
+{
+	struct mlx5_vdpa_irq_pool *irqp = &ndev->irqp;
+	struct mlx5_vdpa_irq_pool_entry *ent;
+	int err;
+	int i;
+
+	for (i = 0; i < irqp->num_ent; i++) {
+		ent = &irqp->entries[i];
+		if (!ent->used) {
+			snprintf(ent->name, MLX5_VDPA_IRQ_NAME_LEN, "%s-vq-%d",
+				 dev_name(&ndev->mvdev.vdev.dev), mvq->index);
+			ent->dev_id = &ndev->event_cbs[mvq->index];
+			err = request_irq(ent->map.virq, mlx5_vdpa_int_handler, 0,
+					  ent->name, ent->dev_id);
+			if (err)
+				return;
+
+			ent->used = true;
+			mvq->map = ent->map;
+			return;
+		}
+	}
+}
+
+static void dealloc_vector(struct mlx5_vdpa_net *ndev,
+			   struct mlx5_vdpa_virtqueue *mvq)
+{
+	struct mlx5_vdpa_irq_pool *irqp = &ndev->irqp;
+	int i;
+
+	for (i = 0; i < irqp->num_ent; i++)
+		if (mvq->map.virq == irqp->entries[i].map.virq) {
+			free_irq(mvq->map.virq, irqp->entries[i].dev_id);
+			irqp->entries[i].used = false;
+			return;
+		}
+}
+
 static int setup_vq(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
 {
 	u16 idx = mvq->index;
@@ -1203,27 +1448,31 @@ static int setup_vq(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
 
 	err = counter_set_alloc(ndev, mvq);
 	if (err)
-		goto err_counter;
-
-	err = create_virtqueue(ndev, mvq);
-	if (err)
 		goto err_connect;
 
+	alloc_vector(ndev, mvq);
+	err = create_virtqueue(ndev, mvq);
+	if (err)
+		goto err_vq;
+
 	if (mvq->ready) {
-		err = modify_virtqueue(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY);
+		err = modify_virtqueue_state(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY);
 		if (err) {
 			mlx5_vdpa_warn(&ndev->mvdev, "failed to modify to ready vq idx %d(%d)\n",
 				       idx, err);
-			goto err_connect;
+			goto err_modify;
 		}
 	}
 
 	mvq->initialized = true;
 	return 0;
 
-err_connect:
+err_modify:
+	destroy_virtqueue(ndev, mvq);
+err_vq:
+	dealloc_vector(ndev, mvq);
 	counter_set_dealloc(ndev, mvq);
-err_counter:
+err_connect:
 	qp_destroy(ndev, &mvq->vqqp);
 err_vqqp:
 	qp_destroy(ndev, &mvq->fwqp);
@@ -1242,7 +1491,7 @@ static void suspend_vq(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *m
 	if (mvq->fw_state != MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY)
 		return;
 
-	if (modify_virtqueue(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_SUSPEND))
+	if (modify_virtqueue_state(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_SUSPEND))
 		mlx5_vdpa_warn(&ndev->mvdev, "modify to suspend failed\n");
 
 	if (query_virtqueue(ndev, mvq, &attr)) {
@@ -1261,13 +1510,33 @@ static void suspend_vqs(struct mlx5_vdpa_net *ndev)
 		suspend_vq(ndev, &ndev->vqs[i]);
 }
 
+static void resume_vq(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
+{
+	if (!mvq->initialized || !is_resumable(ndev))
+		return;
+
+	if (mvq->fw_state != MLX5_VIRTIO_NET_Q_OBJECT_STATE_SUSPEND)
+		return;
+
+	if (modify_virtqueue_state(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY))
+		mlx5_vdpa_warn(&ndev->mvdev, "modify to resume failed for vq %u\n", mvq->index);
+}
+
+static void resume_vqs(struct mlx5_vdpa_net *ndev)
+{
+	for (int i = 0; i < ndev->mvdev.max_vqs; i++)
+		resume_vq(ndev, &ndev->vqs[i]);
+}
+
 static void teardown_vq(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqueue *mvq)
 {
 	if (!mvq->initialized)
 		return;
 
 	suspend_vq(ndev, mvq);
+	mvq->modified_fields = 0;
 	destroy_virtqueue(ndev, mvq);
+	dealloc_vector(ndev, mvq);
 	counter_set_dealloc(ndev, mvq);
 	qp_destroy(ndev, &mvq->vqqp);
 	qp_destroy(ndev, &mvq->fwqp);
@@ -1997,6 +2266,7 @@ static int mlx5_vdpa_set_vq_address(struct vdpa_device *vdev, u16 idx, u64 desc_
 	mvq->desc_addr = desc_area;
 	mvq->device_addr = device_area;
 	mvq->driver_addr = driver_area;
+	mvq->modified_fields |= MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_ADDRS;
 	return 0;
 }
 
@@ -2066,7 +2336,7 @@ static void mlx5_vdpa_set_vq_ready(struct vdpa_device *vdev, u16 idx, bool ready
 	if (!ready) {
 		suspend_vq(ndev, mvq);
 	} else {
-		err = modify_virtqueue(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY);
+		err = modify_virtqueue_state(ndev, mvq, MLX5_VIRTIO_NET_Q_OBJECT_STATE_RDY);
 		if (err) {
 			mlx5_vdpa_warn(mvdev, "modify VQ %d to ready failed (%d)\n", idx, err);
 			ready = false;
@@ -2114,6 +2384,8 @@ static int mlx5_vdpa_set_vq_state(struct vdpa_device *vdev, u16 idx,
 
 	mvq->used_idx = state->split.avail_index;
 	mvq->avail_idx = state->split.avail_index;
+	mvq->modified_fields |= MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_AVAIL_IDX |
+				MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_USED_IDX;
 	return 0;
 }
 
@@ -2171,23 +2443,37 @@ static u32 mlx5_vdpa_get_vq_group(struct vdpa_device *vdev, u16 idx)
 	return MLX5_VDPA_DATAVQ_GROUP;
 }
 
-enum { MLX5_VIRTIO_NET_F_GUEST_CSUM = 1 << 9,
-	MLX5_VIRTIO_NET_F_CSUM = 1 << 10,
-	MLX5_VIRTIO_NET_F_HOST_TSO6 = 1 << 11,
-	MLX5_VIRTIO_NET_F_HOST_TSO4 = 1 << 12,
-};
+static u32 mlx5_vdpa_get_vq_desc_group(struct vdpa_device *vdev, u16 idx)
+{
+	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
+
+	if (is_ctrl_vq_idx(mvdev, idx))
+		return MLX5_VDPA_CVQ_GROUP;
+
+	return MLX5_VDPA_DATAVQ_DESC_GROUP;
+}
 
 static u64 mlx_to_vritio_features(u16 dev_features)
 {
 	u64 result = 0;
 
-	if (dev_features & MLX5_VIRTIO_NET_F_GUEST_CSUM)
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_MRG_RXBUF))
+		result |= BIT_ULL(VIRTIO_NET_F_MRG_RXBUF);
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_HOST_ECN))
+		result |= BIT_ULL(VIRTIO_NET_F_HOST_ECN);
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_GUEST_ECN))
+		result |= BIT_ULL(VIRTIO_NET_F_GUEST_ECN);
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_GUEST_TSO6))
+		result |= BIT_ULL(VIRTIO_NET_F_GUEST_TSO6);
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_GUEST_TSO4))
+		result |= BIT_ULL(VIRTIO_NET_F_GUEST_TSO4);
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_GUEST_CSUM))
 		result |= BIT_ULL(VIRTIO_NET_F_GUEST_CSUM);
-	if (dev_features & MLX5_VIRTIO_NET_F_CSUM)
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_CSUM))
 		result |= BIT_ULL(VIRTIO_NET_F_CSUM);
-	if (dev_features & MLX5_VIRTIO_NET_F_HOST_TSO6)
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_HOST_TSO6))
 		result |= BIT_ULL(VIRTIO_NET_F_HOST_TSO6);
-	if (dev_features & MLX5_VIRTIO_NET_F_HOST_TSO4)
+	if (dev_features & BIT_ULL(MLX5_VIRTIO_NET_F_HOST_TSO4))
 		result |= BIT_ULL(VIRTIO_NET_F_HOST_TSO4);
 
 	return result;
@@ -2298,6 +2584,118 @@ static void update_cvq_info(struct mlx5_vdpa_dev *mvdev)
 	}
 }
 
+static u8 query_vport_state(struct mlx5_core_dev *mdev, u8 opmod, u16 vport)
+{
+	u32 out[MLX5_ST_SZ_DW(query_vport_state_out)] = {};
+	u32 in[MLX5_ST_SZ_DW(query_vport_state_in)] = {};
+	int err;
+
+	MLX5_SET(query_vport_state_in, in, opcode, MLX5_CMD_OP_QUERY_VPORT_STATE);
+	MLX5_SET(query_vport_state_in, in, op_mod, opmod);
+	MLX5_SET(query_vport_state_in, in, vport_number, vport);
+	if (vport)
+		MLX5_SET(query_vport_state_in, in, other_vport, 1);
+
+	err = mlx5_cmd_exec_inout(mdev, query_vport_state, in, out);
+	if (err)
+		return 0;
+
+	return MLX5_GET(query_vport_state_out, out, state);
+}
+
+static bool get_link_state(struct mlx5_vdpa_dev *mvdev)
+{
+	if (query_vport_state(mvdev->mdev, MLX5_VPORT_STATE_OP_MOD_VNIC_VPORT, 0) ==
+	    VPORT_STATE_UP)
+		return true;
+
+	return false;
+}
+
+static void update_carrier(struct work_struct *work)
+{
+	struct mlx5_vdpa_wq_ent *wqent;
+	struct mlx5_vdpa_dev *mvdev;
+	struct mlx5_vdpa_net *ndev;
+
+	wqent = container_of(work, struct mlx5_vdpa_wq_ent, work);
+	mvdev = wqent->mvdev;
+	ndev = to_mlx5_vdpa_ndev(mvdev);
+	if (get_link_state(mvdev))
+		ndev->config.status |= cpu_to_mlx5vdpa16(mvdev, VIRTIO_NET_S_LINK_UP);
+	else
+		ndev->config.status &= cpu_to_mlx5vdpa16(mvdev, ~VIRTIO_NET_S_LINK_UP);
+
+	if (ndev->config_cb.callback)
+		ndev->config_cb.callback(ndev->config_cb.private);
+
+	kfree(wqent);
+}
+
+static int queue_link_work(struct mlx5_vdpa_net *ndev)
+{
+	struct mlx5_vdpa_wq_ent *wqent;
+
+	wqent = kzalloc(sizeof(*wqent), GFP_ATOMIC);
+	if (!wqent)
+		return -ENOMEM;
+
+	wqent->mvdev = &ndev->mvdev;
+	INIT_WORK(&wqent->work, update_carrier);
+	queue_work(ndev->mvdev.wq, &wqent->work);
+	return 0;
+}
+
+static int event_handler(struct notifier_block *nb, unsigned long event, void *param)
+{
+	struct mlx5_vdpa_net *ndev = container_of(nb, struct mlx5_vdpa_net, nb);
+	struct mlx5_eqe *eqe = param;
+	int ret = NOTIFY_DONE;
+
+	if (event == MLX5_EVENT_TYPE_PORT_CHANGE) {
+		switch (eqe->sub_type) {
+		case MLX5_PORT_CHANGE_SUBTYPE_DOWN:
+		case MLX5_PORT_CHANGE_SUBTYPE_ACTIVE:
+			if (queue_link_work(ndev))
+				return NOTIFY_DONE;
+
+			ret = NOTIFY_OK;
+			break;
+		default:
+			return NOTIFY_DONE;
+		}
+		return ret;
+	}
+	return ret;
+}
+
+static void register_link_notifier(struct mlx5_vdpa_net *ndev)
+{
+	if (!(ndev->mvdev.actual_features & BIT_ULL(VIRTIO_NET_F_STATUS)))
+		return;
+
+	ndev->nb.notifier_call = event_handler;
+	mlx5_notifier_register(ndev->mvdev.mdev, &ndev->nb);
+	ndev->nb_registered = true;
+	queue_link_work(ndev);
+}
+
+static void unregister_link_notifier(struct mlx5_vdpa_net *ndev)
+{
+	if (!ndev->nb_registered)
+		return;
+
+	ndev->nb_registered = false;
+	mlx5_notifier_unregister(ndev->mvdev.mdev, &ndev->nb);
+	if (ndev->mvdev.wq)
+		flush_workqueue(ndev->mvdev.wq);
+}
+
+static u64 mlx5_vdpa_get_backend_features(const struct vdpa_device *vdpa)
+{
+	return BIT_ULL(VHOST_BACKEND_F_ENABLE_AFTER_DRIVER_OK);
+}
+
 static int mlx5_vdpa_set_driver_features(struct vdpa_device *vdev, u64 features)
 {
 	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
@@ -2316,7 +2714,15 @@ static int mlx5_vdpa_set_driver_features(struct vdpa_device *vdev, u64 features)
 	else
 		ndev->rqt_size = 1;
 
-	ndev->cur_num_vqs = 2 * ndev->rqt_size;
+	/* Device must start with 1 queue pair, as per VIRTIO v1.2 spec, section
+	 * 5.1.6.5.5 "Device operation in multiqueue mode":
+	 *
+	 * Multiqueue is disabled by default.
+	 * The driver enables multiqueue by sending a command using class
+	 * VIRTIO_NET_CTRL_MQ. The command selects the mode of multiqueue
+	 * operation, as follows: ...
+	 */
+	ndev->cur_num_vqs = 2;
 
 	update_cvq_info(mvdev);
 	return err;
@@ -2374,6 +2780,7 @@ static int save_channel_info(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtqu
 	ri->desc_addr = mvq->desc_addr;
 	ri->device_addr = mvq->device_addr;
 	ri->driver_addr = mvq->driver_addr;
+	ri->map = mvq->map;
 	ri->restore = true;
 	return 0;
 }
@@ -2418,40 +2825,46 @@ static void restore_channels_info(struct mlx5_vdpa_net *ndev)
 		mvq->desc_addr = ri->desc_addr;
 		mvq->device_addr = ri->device_addr;
 		mvq->driver_addr = ri->driver_addr;
+		mvq->map = ri->map;
 	}
 }
 
 static int mlx5_vdpa_change_map(struct mlx5_vdpa_dev *mvdev,
-				struct vhost_iotlb *iotlb, unsigned int asid)
+				struct mlx5_vdpa_mr *new_mr,
+				unsigned int asid)
 {
 	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
+	bool teardown = !is_resumable(ndev);
 	int err;
 
 	suspend_vqs(ndev);
-	err = save_channels_info(ndev);
-	if (err)
-		goto err_mr;
+	if (teardown) {
+		err = save_channels_info(ndev);
+		if (err)
+			return err;
 
-	teardown_driver(ndev);
-	mlx5_vdpa_destroy_mr(mvdev);
-	err = mlx5_vdpa_create_mr(mvdev, iotlb, asid);
-	if (err)
-		goto err_mr;
+		teardown_driver(ndev);
+	}
+
+	mlx5_vdpa_update_mr(mvdev, new_mr, asid);
+
+	for (int i = 0; i < ndev->cur_num_vqs; i++)
+		ndev->vqs[i].modified_fields |= MLX5_VIRTQ_MODIFY_MASK_VIRTIO_Q_MKEY |
+						MLX5_VIRTQ_MODIFY_MASK_DESC_GROUP_MKEY;
 
 	if (!(mvdev->status & VIRTIO_CONFIG_S_DRIVER_OK) || mvdev->suspended)
-		goto err_mr;
+		return 0;
 
-	restore_channels_info(ndev);
-	err = setup_driver(mvdev);
-	if (err)
-		goto err_setup;
+	if (teardown) {
+		restore_channels_info(ndev);
+		err = setup_driver(mvdev);
+		if (err)
+			return err;
+	}
+
+	resume_vqs(ndev);
 
 	return 0;
-
-err_setup:
-	mlx5_vdpa_destroy_mr(mvdev);
-err_mr:
-	return err;
 }
 
 /* reslock must be held for this function */
@@ -2468,6 +2881,11 @@ static int setup_driver(struct mlx5_vdpa_dev *mvdev)
 		goto out;
 	}
 	mlx5_vdpa_add_debugfs(ndev);
+
+	err = read_umem_params(ndev);
+	if (err)
+		goto err_setup;
+
 	err = setup_virtqueues(mvdev);
 	if (err) {
 		mlx5_vdpa_warn(mvdev, "setup_virtqueues\n");
@@ -2502,7 +2920,7 @@ err_tir:
 err_rqt:
 	teardown_virtqueues(ndev);
 err_setup:
-	mlx5_vdpa_remove_debugfs(ndev->debugfs);
+	mlx5_vdpa_remove_debugfs(ndev);
 out:
 	return err;
 }
@@ -2516,8 +2934,7 @@ static void teardown_driver(struct mlx5_vdpa_net *ndev)
 	if (!ndev->setup)
 		return;
 
-	mlx5_vdpa_remove_debugfs(ndev->debugfs);
-	ndev->debugfs = NULL;
+	mlx5_vdpa_remove_debugfs(ndev);
 	teardown_steering(ndev);
 	destroy_tir(ndev);
 	destroy_rqt(ndev);
@@ -2529,8 +2946,10 @@ static void clear_vqs_ready(struct mlx5_vdpa_net *ndev)
 {
 	int i;
 
-	for (i = 0; i < ndev->mvdev.max_vqs; i++)
+	for (i = 0; i < ndev->mvdev.max_vqs; i++) {
 		ndev->vqs[i].ready = false;
+		ndev->vqs[i].modified_fields = 0;
+	}
 
 	ndev->mvdev.cvq.ready = false;
 }
@@ -2540,13 +2959,18 @@ static int setup_cvq_vring(struct mlx5_vdpa_dev *mvdev)
 	struct mlx5_control_vq *cvq = &mvdev->cvq;
 	int err = 0;
 
-	if (mvdev->actual_features & BIT_ULL(VIRTIO_NET_F_CTRL_VQ))
+	if (mvdev->actual_features & BIT_ULL(VIRTIO_NET_F_CTRL_VQ)) {
+		u16 idx = cvq->vring.last_avail_idx;
+
 		err = vringh_init_iotlb(&cvq->vring, mvdev->actual_features,
 					MLX5_CVQ_MAX_ENT, false,
 					(struct vring_desc *)(uintptr_t)cvq->desc_addr,
 					(struct vring_avail *)(uintptr_t)cvq->driver_addr,
 					(struct vring_used *)(uintptr_t)cvq->device_addr);
 
+		if (!err)
+			cvq->vring.last_avail_idx = cvq->vring.last_used_idx = idx;
+	}
 	return err;
 }
 
@@ -2567,10 +2991,11 @@ static void mlx5_vdpa_set_status(struct vdpa_device *vdev, u8 status)
 				mlx5_vdpa_warn(mvdev, "failed to setup control VQ vring\n");
 				goto err_setup;
 			}
+			register_link_notifier(ndev);
 			err = setup_driver(mvdev);
 			if (err) {
 				mlx5_vdpa_warn(mvdev, "failed to setup driver\n");
-				goto err_setup;
+				goto err_driver;
 			}
 		} else {
 			mlx5_vdpa_warn(mvdev, "did not expect DRIVER_OK to be cleared\n");
@@ -2582,8 +3007,10 @@ static void mlx5_vdpa_set_status(struct vdpa_device *vdev, u8 status)
 	up_write(&ndev->reslock);
 	return;
 
+err_driver:
+	unregister_link_notifier(ndev);
 err_setup:
-	mlx5_vdpa_destroy_mr(&ndev->mvdev);
+	mlx5_vdpa_destroy_mr_resources(&ndev->mvdev);
 	ndev->mvdev.status |= VIRTIO_CONFIG_S_FAILED;
 err_clear:
 	up_write(&ndev->reslock);
@@ -2598,7 +3025,7 @@ static void init_group_to_asid_map(struct mlx5_vdpa_dev *mvdev)
 		mvdev->group2asid[i] = 0;
 }
 
-static int mlx5_vdpa_reset(struct vdpa_device *vdev)
+static int mlx5_vdpa_compat_reset(struct vdpa_device *vdev, u32 flags)
 {
 	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
 	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
@@ -2607,9 +3034,11 @@ static int mlx5_vdpa_reset(struct vdpa_device *vdev)
 	mlx5_vdpa_info(mvdev, "performing device reset\n");
 
 	down_write(&ndev->reslock);
+	unregister_link_notifier(ndev);
 	teardown_driver(ndev);
 	clear_vqs_ready(ndev);
-	mlx5_vdpa_destroy_mr(&ndev->mvdev);
+	if (flags & VDPA_RESET_F_CLEAN_MAP)
+		mlx5_vdpa_destroy_mr_resources(&ndev->mvdev);
 	ndev->mvdev.status = 0;
 	ndev->mvdev.suspended = false;
 	ndev->cur_num_vqs = 0;
@@ -2620,13 +3049,19 @@ static int mlx5_vdpa_reset(struct vdpa_device *vdev)
 	init_group_to_asid_map(mvdev);
 	++mvdev->generation;
 
-	if (MLX5_CAP_GEN(mvdev->mdev, umem_uid_0)) {
-		if (mlx5_vdpa_create_mr(mvdev, NULL, 0))
+	if ((flags & VDPA_RESET_F_CLEAN_MAP) &&
+	    MLX5_CAP_GEN(mvdev->mdev, umem_uid_0)) {
+		if (mlx5_vdpa_create_dma_mr(mvdev))
 			mlx5_vdpa_warn(mvdev, "create MR failed\n");
 	}
 	up_write(&ndev->reslock);
 
 	return 0;
+}
+
+static int mlx5_vdpa_reset(struct vdpa_device *vdev)
+{
+	return mlx5_vdpa_compat_reset(vdev, 0);
 }
 
 static size_t mlx5_vdpa_get_config_size(struct vdpa_device *vdev)
@@ -2660,18 +3095,38 @@ static u32 mlx5_vdpa_get_generation(struct vdpa_device *vdev)
 static int set_map_data(struct mlx5_vdpa_dev *mvdev, struct vhost_iotlb *iotlb,
 			unsigned int asid)
 {
-	bool change_map;
+	struct mlx5_vdpa_mr *new_mr;
 	int err;
 
-	err = mlx5_vdpa_handle_set_map(mvdev, iotlb, &change_map, asid);
-	if (err) {
-		mlx5_vdpa_warn(mvdev, "set map failed(%d)\n", err);
-		return err;
+	if (asid >= MLX5_VDPA_NUM_AS)
+		return -EINVAL;
+
+	if (vhost_iotlb_itree_first(iotlb, 0, U64_MAX)) {
+		new_mr = mlx5_vdpa_create_mr(mvdev, iotlb);
+		if (IS_ERR(new_mr)) {
+			err = PTR_ERR(new_mr);
+			mlx5_vdpa_warn(mvdev, "create map failed(%d)\n", err);
+			return err;
+		}
+	} else {
+		/* Empty iotlbs don't have an mr but will clear the previous mr. */
+		new_mr = NULL;
 	}
 
-	if (change_map)
-		err = mlx5_vdpa_change_map(mvdev, iotlb, asid);
+	if (!mvdev->mr[asid]) {
+		mlx5_vdpa_update_mr(mvdev, new_mr, asid);
+	} else {
+		err = mlx5_vdpa_change_map(mvdev, new_mr, asid);
+		if (err) {
+			mlx5_vdpa_warn(mvdev, "change map failed(%d)\n", err);
+			goto out_err;
+		}
+	}
 
+	return mlx5_vdpa_update_cvq_iotlb(mvdev, iotlb, asid);
+
+out_err:
+	mlx5_vdpa_put_mr(mvdev, new_mr);
 	return err;
 }
 
@@ -2688,6 +3143,18 @@ static int mlx5_vdpa_set_map(struct vdpa_device *vdev, unsigned int asid,
 	return err;
 }
 
+static int mlx5_vdpa_reset_map(struct vdpa_device *vdev, unsigned int asid)
+{
+	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
+	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
+	int err;
+
+	down_write(&ndev->reslock);
+	err = mlx5_vdpa_reset_mr(mvdev, asid);
+	up_write(&ndev->reslock);
+	return err;
+}
+
 static struct device *mlx5_get_vq_dma_dev(struct vdpa_device *vdev, u16 idx)
 {
 	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
@@ -2696,6 +3163,25 @@ static struct device *mlx5_get_vq_dma_dev(struct vdpa_device *vdev, u16 idx)
 		return &vdev->dev;
 
 	return mvdev->vdev.dma_dev;
+}
+
+static void free_irqs(struct mlx5_vdpa_net *ndev)
+{
+	struct mlx5_vdpa_irq_pool_entry *ent;
+	int i;
+
+	if (!msix_mode_supported(&ndev->mvdev))
+		return;
+
+	if (!ndev->irqp.entries)
+		return;
+
+	for (i = ndev->irqp.num_ent - 1; i >= 0; i--) {
+		ent = ndev->irqp.entries + i;
+		if (ent->map.virq)
+			pci_msix_free_irq(ndev->mvdev.mdev->pdev, ent->map);
+	}
+	kfree(ndev->irqp.entries);
 }
 
 static void mlx5_vdpa_free(struct vdpa_device *vdev)
@@ -2707,12 +3193,13 @@ static void mlx5_vdpa_free(struct vdpa_device *vdev)
 	ndev = to_mlx5_vdpa_ndev(mvdev);
 
 	free_resources(ndev);
-	mlx5_vdpa_destroy_mr(mvdev);
+	mlx5_vdpa_destroy_mr_resources(mvdev);
 	if (!is_zero_ether_addr(ndev->config.mac)) {
 		pfmdev = pci_get_drvdata(pci_physfn(mvdev->mdev->pdev));
 		mlx5_mpfs_del_mac(pfmdev, ndev->config.mac);
 	}
 	mlx5_vdpa_free_resources(&ndev->mvdev);
+	free_irqs(ndev);
 	kfree(ndev->event_cbs);
 	kfree(ndev->vqs);
 }
@@ -2741,9 +3228,23 @@ static struct vdpa_notification_area mlx5_get_vq_notification(struct vdpa_device
 	return ret;
 }
 
-static int mlx5_get_vq_irq(struct vdpa_device *vdv, u16 idx)
+static int mlx5_get_vq_irq(struct vdpa_device *vdev, u16 idx)
 {
-	return -EOPNOTSUPP;
+	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
+	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
+	struct mlx5_vdpa_virtqueue *mvq;
+
+	if (!is_index_valid(mvdev, idx))
+		return -EINVAL;
+
+	if (is_ctrl_vq_idx(mvdev, idx))
+		return -EOPNOTSUPP;
+
+	mvq = &ndev->vqs[idx];
+	if (!mvq->map.virq)
+		return -EOPNOTSUPP;
+
+	return mvq->map.virq;
 }
 
 static u64 mlx5_vdpa_get_driver_features(struct vdpa_device *vdev)
@@ -2861,9 +3362,7 @@ static int mlx5_vdpa_suspend(struct vdpa_device *vdev)
 	mlx5_vdpa_info(mvdev, "suspending device\n");
 
 	down_write(&ndev->reslock);
-	ndev->nb_registered = false;
-	mlx5_notifier_unregister(mvdev->mdev, &ndev->nb);
-	flush_workqueue(ndev->mvdev.wq);
+	unregister_link_notifier(ndev);
 	for (i = 0; i < ndev->cur_num_vqs; i++) {
 		mvq = &ndev->vqs[i];
 		suspend_vq(ndev, mvq);
@@ -2874,16 +3373,40 @@ static int mlx5_vdpa_suspend(struct vdpa_device *vdev)
 	return 0;
 }
 
+static int mlx5_vdpa_resume(struct vdpa_device *vdev)
+{
+	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
+	struct mlx5_vdpa_net *ndev;
+
+	ndev = to_mlx5_vdpa_ndev(mvdev);
+
+	mlx5_vdpa_info(mvdev, "resuming device\n");
+
+	down_write(&ndev->reslock);
+	mvdev->suspended = false;
+	resume_vqs(ndev);
+	register_link_notifier(ndev);
+	up_write(&ndev->reslock);
+	return 0;
+}
+
 static int mlx5_set_group_asid(struct vdpa_device *vdev, u32 group,
 			       unsigned int asid)
 {
 	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
+	int err = 0;
 
 	if (group >= MLX5_VDPA_NUMVQ_GROUPS)
 		return -EINVAL;
 
 	mvdev->group2asid[group] = asid;
-	return 0;
+
+	mutex_lock(&mvdev->mr_mtx);
+	if (group == MLX5_VDPA_CVQ_GROUP && mvdev->mr[asid])
+		err = mlx5_vdpa_update_cvq_iotlb(mvdev, mvdev->mr[asid]->iotlb, asid);
+	mutex_unlock(&mvdev->mr_mtx);
+
+	return err;
 }
 
 static const struct vdpa_config_ops mlx5_vdpa_ops = {
@@ -2900,7 +3423,9 @@ static const struct vdpa_config_ops mlx5_vdpa_ops = {
 	.get_vq_irq = mlx5_get_vq_irq,
 	.get_vq_align = mlx5_vdpa_get_vq_align,
 	.get_vq_group = mlx5_vdpa_get_vq_group,
+	.get_vq_desc_group = mlx5_vdpa_get_vq_desc_group, /* Op disabled if not supported. */
 	.get_device_features = mlx5_vdpa_get_device_features,
+	.get_backend_features = mlx5_vdpa_get_backend_features,
 	.set_driver_features = mlx5_vdpa_set_driver_features,
 	.get_driver_features = mlx5_vdpa_get_driver_features,
 	.set_config_cb = mlx5_vdpa_set_config_cb,
@@ -2910,15 +3435,18 @@ static const struct vdpa_config_ops mlx5_vdpa_ops = {
 	.get_status = mlx5_vdpa_get_status,
 	.set_status = mlx5_vdpa_set_status,
 	.reset = mlx5_vdpa_reset,
+	.compat_reset = mlx5_vdpa_compat_reset,
 	.get_config_size = mlx5_vdpa_get_config_size,
 	.get_config = mlx5_vdpa_get_config,
 	.set_config = mlx5_vdpa_set_config,
 	.get_generation = mlx5_vdpa_get_generation,
 	.set_map = mlx5_vdpa_set_map,
+	.reset_map = mlx5_vdpa_reset_map,
 	.set_group_asid = mlx5_set_group_asid,
 	.get_vq_dma_dev = mlx5_get_vq_dma_dev,
 	.free = mlx5_vdpa_free,
 	.suspend = mlx5_vdpa_suspend,
+	.resume = mlx5_vdpa_resume, /* Op disabled if not supported. */
 };
 
 static int query_mtu(struct mlx5_core_dev *mdev, u16 *mtu)
@@ -2998,85 +3526,8 @@ struct mlx5_vdpa_mgmtdev {
 	struct vdpa_mgmt_dev mgtdev;
 	struct mlx5_adev *madev;
 	struct mlx5_vdpa_net *ndev;
+	struct vdpa_config_ops vdpa_ops;
 };
-
-static u8 query_vport_state(struct mlx5_core_dev *mdev, u8 opmod, u16 vport)
-{
-	u32 out[MLX5_ST_SZ_DW(query_vport_state_out)] = {};
-	u32 in[MLX5_ST_SZ_DW(query_vport_state_in)] = {};
-	int err;
-
-	MLX5_SET(query_vport_state_in, in, opcode, MLX5_CMD_OP_QUERY_VPORT_STATE);
-	MLX5_SET(query_vport_state_in, in, op_mod, opmod);
-	MLX5_SET(query_vport_state_in, in, vport_number, vport);
-	if (vport)
-		MLX5_SET(query_vport_state_in, in, other_vport, 1);
-
-	err = mlx5_cmd_exec_inout(mdev, query_vport_state, in, out);
-	if (err)
-		return 0;
-
-	return MLX5_GET(query_vport_state_out, out, state);
-}
-
-static bool get_link_state(struct mlx5_vdpa_dev *mvdev)
-{
-	if (query_vport_state(mvdev->mdev, MLX5_VPORT_STATE_OP_MOD_VNIC_VPORT, 0) ==
-	    VPORT_STATE_UP)
-		return true;
-
-	return false;
-}
-
-static void update_carrier(struct work_struct *work)
-{
-	struct mlx5_vdpa_wq_ent *wqent;
-	struct mlx5_vdpa_dev *mvdev;
-	struct mlx5_vdpa_net *ndev;
-
-	wqent = container_of(work, struct mlx5_vdpa_wq_ent, work);
-	mvdev = wqent->mvdev;
-	ndev = to_mlx5_vdpa_ndev(mvdev);
-	if (get_link_state(mvdev))
-		ndev->config.status |= cpu_to_mlx5vdpa16(mvdev, VIRTIO_NET_S_LINK_UP);
-	else
-		ndev->config.status &= cpu_to_mlx5vdpa16(mvdev, ~VIRTIO_NET_S_LINK_UP);
-
-	if (ndev->nb_registered && ndev->config_cb.callback)
-		ndev->config_cb.callback(ndev->config_cb.private);
-
-	kfree(wqent);
-}
-
-static int event_handler(struct notifier_block *nb, unsigned long event, void *param)
-{
-	struct mlx5_vdpa_net *ndev = container_of(nb, struct mlx5_vdpa_net, nb);
-	struct mlx5_eqe *eqe = param;
-	int ret = NOTIFY_DONE;
-	struct mlx5_vdpa_wq_ent *wqent;
-
-	if (event == MLX5_EVENT_TYPE_PORT_CHANGE) {
-		if (!(ndev->mvdev.actual_features & BIT_ULL(VIRTIO_NET_F_STATUS)))
-			return NOTIFY_DONE;
-		switch (eqe->sub_type) {
-		case MLX5_PORT_CHANGE_SUBTYPE_DOWN:
-		case MLX5_PORT_CHANGE_SUBTYPE_ACTIVE:
-			wqent = kzalloc(sizeof(*wqent), GFP_ATOMIC);
-			if (!wqent)
-				return NOTIFY_DONE;
-
-			wqent->mvdev = &ndev->mvdev;
-			INIT_WORK(&wqent->work, update_carrier);
-			queue_work(ndev->mvdev.wq, &wqent->work);
-			ret = NOTIFY_OK;
-			break;
-		default:
-			return NOTIFY_DONE;
-		}
-		return ret;
-	}
-	return ret;
-}
 
 static int config_func_mtu(struct mlx5_core_dev *mdev, u16 mtu)
 {
@@ -3098,6 +3549,34 @@ static int config_func_mtu(struct mlx5_core_dev *mdev, u16 mtu)
 
 	kvfree(in);
 	return err;
+}
+
+static void allocate_irqs(struct mlx5_vdpa_net *ndev)
+{
+	struct mlx5_vdpa_irq_pool_entry *ent;
+	int i;
+
+	if (!msix_mode_supported(&ndev->mvdev))
+		return;
+
+	if (!ndev->mvdev.mdev->pdev)
+		return;
+
+	ndev->irqp.entries = kcalloc(ndev->mvdev.max_vqs, sizeof(*ndev->irqp.entries), GFP_KERNEL);
+	if (!ndev->irqp.entries)
+		return;
+
+
+	for (i = 0; i < ndev->mvdev.max_vqs; i++) {
+		ent = ndev->irqp.entries + i;
+		snprintf(ent->name, MLX5_VDPA_IRQ_NAME_LEN, "%s-vq-%d",
+			 dev_name(&ndev->mvdev.vdev.dev), i);
+		ent->map = pci_msix_alloc_irq_at(ndev->mvdev.mdev->pdev, MSI_ANY_INDEX, NULL);
+		if (!ent->map.virq)
+			return;
+
+		ndev->irqp.num_ent++;
+	}
 }
 
 static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
@@ -3127,6 +3606,8 @@ static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
 			return -EINVAL;
 		}
 		device_features &= add_config->device_features;
+	} else {
+		device_features &= ~BIT_ULL(VIRTIO_NET_F_MRG_RXBUF);
 	}
 	if (!(device_features & BIT_ULL(VIRTIO_F_VERSION_1) &&
 	      device_features & BIT_ULL(VIRTIO_F_ACCESS_PLATFORM))) {
@@ -3159,7 +3640,7 @@ static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
 		max_vqs = 2;
 	}
 
-	ndev = vdpa_alloc_device(struct mlx5_vdpa_net, mvdev.vdev, mdev->device, &mlx5_vdpa_ops,
+	ndev = vdpa_alloc_device(struct mlx5_vdpa_net, mvdev.vdev, mdev->device, &mgtdev->vdpa_ops,
 				 MLX5_VDPA_NUMVQ_GROUPS, MLX5_VDPA_NUM_AS, name, false);
 	if (IS_ERR(ndev))
 		return PTR_ERR(ndev);
@@ -3176,6 +3657,7 @@ static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
 	}
 
 	init_mvqs(ndev);
+	allocate_irqs(ndev);
 	init_rwsem(&ndev->reslock);
 	config = &ndev->config;
 
@@ -3240,8 +3722,10 @@ static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
 	if (err)
 		goto err_mpfs;
 
+	INIT_LIST_HEAD(&mvdev->mr_list_head);
+
 	if (MLX5_CAP_GEN(mvdev->mdev, umem_uid_0)) {
-		err = mlx5_vdpa_create_mr(mvdev, NULL, 0);
+		err = mlx5_vdpa_create_dma_mr(mvdev);
 		if (err)
 			goto err_res;
 	}
@@ -3258,9 +3742,6 @@ static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
 		goto err_res2;
 	}
 
-	ndev->nb.notifier_call = event_handler;
-	mlx5_notifier_register(mdev, &ndev->nb);
-	ndev->nb_registered = true;
 	mvdev->vdev.mdev = &mgtdev->mgtdev;
 	err = _vdpa_register_device(&mvdev->vdev, max_vqs + 1);
 	if (err)
@@ -3274,7 +3755,7 @@ err_reg:
 err_res2:
 	free_resources(ndev);
 err_mr:
-	mlx5_vdpa_destroy_mr(mvdev);
+	mlx5_vdpa_destroy_mr_resources(mvdev);
 err_res:
 	mlx5_vdpa_free_resources(&ndev->mvdev);
 err_mpfs:
@@ -3292,16 +3773,11 @@ static void mlx5_vdpa_dev_del(struct vdpa_mgmt_dev *v_mdev, struct vdpa_device *
 	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
 	struct workqueue_struct *wq;
 
-	mlx5_vdpa_remove_debugfs(ndev->debugfs);
-	ndev->debugfs = NULL;
-	if (ndev->nb_registered) {
-		ndev->nb_registered = false;
-		mlx5_notifier_unregister(mvdev->mdev, &ndev->nb);
-	}
+	unregister_link_notifier(ndev);
+	_vdpa_unregister_device(dev);
 	wq = mvdev->wq;
 	mvdev->wq = NULL;
 	destroy_workqueue(wq);
-	_vdpa_unregister_device(dev);
 	mgtdev->ndev = NULL;
 }
 
@@ -3339,6 +3815,13 @@ static int mlx5v_probe(struct auxiliary_device *adev,
 		MLX5_CAP_DEV_VDPA_EMULATION(mdev, max_num_virtio_queues) + 1;
 	mgtdev->mgtdev.supported_features = get_supported_features(mdev);
 	mgtdev->madev = madev;
+	mgtdev->vdpa_ops = mlx5_vdpa_ops;
+
+	if (!MLX5_CAP_DEV_VDPA_EMULATION(mdev, desc_group_mkey_supported))
+		mgtdev->vdpa_ops.get_vq_desc_group = NULL;
+
+	if (!MLX5_CAP_DEV_VDPA_EMULATION(mdev, freeze_to_rdy_supported))
+		mgtdev->vdpa_ops.resume = NULL;
 
 	err = vdpa_mgmtdev_register(&mgtdev->mgtdev);
 	if (err)

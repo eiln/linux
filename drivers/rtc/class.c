@@ -256,7 +256,7 @@ static int rtc_device_get_id(struct device *dev)
 		of_id = of_alias_get_id(dev->parent->of_node, "rtc");
 
 	if (of_id >= 0) {
-		id = ida_simple_get(&rtc_ida, of_id, of_id + 1, GFP_KERNEL);
+		id = ida_alloc_range(&rtc_ida, of_id, of_id, GFP_KERNEL);
 		if (id < 0)
 			dev_warn(dev, "/aliases ID %d not available\n", of_id);
 	}
@@ -475,7 +475,7 @@ EXPORT_SYMBOL_GPL(devm_rtc_device_register);
 
 static int __init rtc_init(void)
 {
-	rtc_class = class_create(THIS_MODULE, "rtc");
+	rtc_class = class_create("rtc");
 	if (IS_ERR(rtc_class)) {
 		pr_err("couldn't create class\n");
 		return PTR_ERR(rtc_class);

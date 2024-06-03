@@ -78,6 +78,8 @@ pub(crate) struct GenericAlloc<T, U: RawAllocation> {
     alloc_size: usize,
     debug_offset: usize,
     padding: usize,
+    tag: u32,
+    pad_word: u32,
     _p: PhantomData<T>,
 }
 
@@ -112,7 +114,7 @@ impl<T, U: RawAllocation> Debug for GenericAlloc<T, U> {
 #[repr(C)]
 struct AllocDebugData {
     state: u32,
-    _pad: u32,
+    tag: u32,
     size: u64,
     base_gpuva: u64,
     obj_gpuva: u64,
@@ -120,12 +122,12 @@ struct AllocDebugData {
 }
 
 /// Magic flag indicating a live allocation.
-const STATE_LIVE: u32 = 0x4556494c;
+const STATE_LIVE: u32 = u32::from_le_bytes(*b"LIVE");
 /// Magic flag indicating a freed allocation.
-const STATE_DEAD: u32 = 0x44414544;
+const STATE_DEAD: u32 = u32::from_le_bytes(*b"DEAD");
 
 /// Marker byte to identify when firmware/GPU write beyond the end of an allocation.
-const GUARD_MARKER: u8 = 0x93;
+const GUARD_MARKER: u32 = 0x93939393;
 
 impl<T, U: RawAllocation> Drop for GenericAlloc<T, U> {
     fn drop(&mut self) {
@@ -151,20 +153,26 @@ impl<T, U: RawAllocation> Drop for GenericAlloc<T, U> {
                         self.padding,
                     )
                 };
-                if let Some(first_err) = guard.iter().position(|&r| r != GUARD_MARKER) {
-                    let last_err = guard
-                        .iter()
-                        .rev()
-                        .position(|&r| r != GUARD_MARKER)
-                        .unwrap_or(0);
+                let mut first_err = None;
+                let mut last_err = 0;
+                for (i, p) in guard.iter().enumerate() {
+                    if *p != (self.pad_word >> (8 * (i & 3))) as u8 {
+                        if first_err.is_none() {
+                            first_err = Some(i);
+                        }
+                        last_err = i;
+                    }
+                }
+                if let Some(start) = first_err {
                     dev_warn!(
                         self.device(),
-                        "Allocator: Corruption after object of type {} at {:#x}:{:#x} + {:#x}..={:#x}\n",
+                        "Allocator: Corruption after object of type {}/{:#x} at {:#x}:{:#x} + {:#x}..={:#x}\n",
                         core::any::type_name::<T>(),
+                        self.tag,
                         self.gpu_ptr(),
                         self.size(),
-                        first_err,
-                        self.padding - last_err - 1
+                        start,
+                        last_err,
                     );
                 }
             }
@@ -292,6 +300,7 @@ pub(crate) trait Allocator {
         &mut self,
         size: usize,
         align: usize,
+        tag: Option<u32>,
     ) -> Result<GenericAlloc<T, Self::Raw>> {
         let padding = if debug_enabled(DebugFlags::DetectOverflows) {
             size
@@ -309,7 +318,7 @@ pub(crate) trait Allocator {
 
                 let mut debug = AllocDebugData {
                     state: STATE_LIVE,
-                    _pad: 0,
+                    tag: tag.unwrap_or(0),
                     size: size as u64,
                     base_gpuva: alloc.gpu_ptr(),
                     obj_gpuva: alloc.gpu_ptr() + debug_offset as u64,
@@ -335,6 +344,8 @@ pub(crate) trait Allocator {
                     alloc,
                     alloc_size: size,
                     debug_offset,
+                    tag: tag.unwrap_or(0),
+                    pad_word: tag.unwrap_or(GUARD_MARKER) | 0x81818181,
                     padding,
                     _p: PhantomData,
                 }
@@ -343,6 +354,8 @@ pub(crate) trait Allocator {
                     alloc: self.alloc(size + padding, align)?,
                     alloc_size: size,
                     debug_offset: 0,
+                    tag: tag.unwrap_or(0),
+                    pad_word: tag.unwrap_or(GUARD_MARKER) | 0x81818181,
                     padding,
                     _p: PhantomData,
                 }
@@ -356,10 +369,14 @@ pub(crate) trait Allocator {
 
         if padding != 0 {
             if let Some(p) = ret.ptr() {
-                unsafe {
-                    (p.as_ptr() as *mut u8)
-                        .add(ret.size())
-                        .write_bytes(GUARD_MARKER, padding);
+                let guard = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (p.as_ptr() as *mut u8).add(ret.size()),
+                        padding,
+                    )
+                };
+                for (i, p) in guard.iter_mut().enumerate() {
+                    *p = (ret.pad_word >> (8 * (i & 3))) as u8;
                 }
             }
         }
@@ -376,7 +393,7 @@ pub(crate) trait Allocator {
         let size = mem::size_of::<T::Raw<'static>>();
         let align = mem::align_of::<T::Raw<'static>>();
 
-        self.alloc_generic(size, align)
+        self.alloc_generic(size, align, None)
     }
 
     /// Allocate an empty `GpuArray` of a given type and length.
@@ -387,7 +404,20 @@ pub(crate) trait Allocator {
         let size = mem::size_of::<T>() * count;
         let align = mem::align_of::<T>();
 
-        let alloc = self.alloc_generic(size, align)?;
+        let alloc = self.alloc_generic(size, align, None)?;
+        GpuArray::<T, GenericAlloc<T, Self::Raw>>::empty(alloc, count)
+    }
+
+    /// Allocate an empty `GpuArray` of a given type and length.
+    fn array_empty_tagged<T: Sized + Default>(
+        &mut self,
+        count: usize,
+        tag: &[u8; 4],
+    ) -> Result<GpuArray<T, GenericAlloc<T, Self::Raw>>> {
+        let size = mem::size_of::<T>() * count;
+        let align = mem::align_of::<T>();
+
+        let alloc = self.alloc_generic(size, align, Some(u32::from_le_bytes(*tag)))?;
         GpuArray::<T, GenericAlloc<T, Self::Raw>>::empty(alloc, count)
     }
 
@@ -399,7 +429,7 @@ pub(crate) trait Allocator {
         let size = mem::size_of::<T>() * count;
         let align = mem::align_of::<T>();
 
-        let alloc = self.alloc_generic(size, align)?;
+        let alloc = self.alloc_generic(size, align, None)?;
         GpuOnlyArray::<T, GenericAlloc<T, Self::Raw>>::new(alloc, count)
     }
 }
@@ -545,7 +575,7 @@ impl Allocator for SimpleAllocator {
             true,
         )?;
 
-        let ptr = unsafe { p.add(offset) } as *mut u8;
+        let ptr = unsafe { p.add(offset) };
         let gpu_ptr = (iova + offset) as u64;
 
         mod_dev_dbg!(

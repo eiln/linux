@@ -8,7 +8,7 @@
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/regulator/consumer.h>
 
@@ -59,7 +59,6 @@ struct nt35950 {
 
 	int cur_mode;
 	u8 last_page;
-	bool prepared;
 };
 
 struct nt35950_panel_mode {
@@ -431,9 +430,6 @@ static int nt35950_prepare(struct drm_panel *panel)
 	struct device *dev = &nt->dsi[0]->dev;
 	int ret;
 
-	if (nt->prepared)
-		return 0;
-
 	ret = regulator_enable(nt->vregs[0].consumer);
 	if (ret)
 		return ret;
@@ -460,7 +456,6 @@ static int nt35950_prepare(struct drm_panel *panel)
 		dev_err(dev, "Failed to initialize panel: %d\n", ret);
 		goto end;
 	}
-	nt->prepared = true;
 
 end:
 	if (ret < 0) {
@@ -477,9 +472,6 @@ static int nt35950_unprepare(struct drm_panel *panel)
 	struct device *dev = &nt->dsi[0]->dev;
 	int ret;
 
-	if (!nt->prepared)
-		return 0;
-
 	ret = nt35950_off(nt);
 	if (ret < 0)
 		dev_err(dev, "Failed to deinitialize panel: %d\n", ret);
@@ -487,7 +479,6 @@ static int nt35950_unprepare(struct drm_panel *panel)
 	gpiod_set_value_cansleep(nt->reset_gpio, 0);
 	regulator_bulk_disable(ARRAY_SIZE(nt->vregs), nt->vregs);
 
-	nt->prepared = false;
 	return 0;
 }
 
@@ -585,8 +576,12 @@ static int nt35950_probe(struct mipi_dsi_device *dsi)
 		       DRM_MODE_CONNECTOR_DSI);
 
 	ret = drm_panel_of_backlight(&nt->panel);
-	if (ret)
+	if (ret) {
+		if (num_dsis == 2)
+			mipi_dsi_device_unregister(nt->dsi[1]);
+
 		return dev_err_probe(dev, ret, "Failed to get backlight\n");
+	}
 
 	drm_panel_add(&nt->panel);
 
@@ -602,6 +597,10 @@ static int nt35950_probe(struct mipi_dsi_device *dsi)
 
 		ret = mipi_dsi_attach(nt->dsi[i]);
 		if (ret < 0) {
+			/* If we fail to attach to either host, we're done */
+			if (num_dsis == 2)
+				mipi_dsi_device_unregister(nt->dsi[1]);
+
 			return dev_err_probe(dev, ret,
 					     "Cannot attach to DSI%d host.\n", i);
 		}

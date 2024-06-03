@@ -296,11 +296,12 @@ static int tmag5273_read_raw(struct iio_dev *indio_dev,
 			return ret;
 
 		ret = tmag5273_get_measure(data, &t, &x, &y, &z, &angle, &magnitude);
-		if (ret)
-			return ret;
 
 		pm_runtime_mark_last_busy(data->dev);
 		pm_runtime_put_autosuspend(data->dev);
+
+		if (ret)
+			return ret;
 
 		switch (chan->address) {
 		case TEMPERATURE:
@@ -355,7 +356,7 @@ static int tmag5273_read_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_OFFSET:
 		switch (chan->type) {
 		case IIO_TEMP:
-			*val = -266314;
+			*val = -16005;
 			return IIO_VAL_INT;
 		default:
 			return -EINVAL;
@@ -496,17 +497,13 @@ static int tmag5273_set_operating_mode(struct tmag5273_data *data,
 static void tmag5273_read_device_property(struct tmag5273_data *data)
 {
 	struct device *dev = data->dev;
-	const char *str;
 	int ret;
 
 	data->angle_measurement = TMAG5273_ANGLE_EN_X_Y;
 
-	ret = device_property_read_string(dev, "ti,angle-measurement", &str);
-	if (ret)
-		return;
-
-	ret = match_string(tmag5273_angle_names,
-			   ARRAY_SIZE(tmag5273_angle_names), str);
+	ret = device_property_match_property_string(dev, "ti,angle-measurement",
+						    tmag5273_angle_names,
+						    ARRAY_SIZE(tmag5273_angle_names));
 	if (ret >= 0)
 		data->angle_measurement = ret;
 }
@@ -733,7 +730,7 @@ static struct i2c_driver tmag5273_driver = {
 		.of_match_table = tmag5273_of_match,
 		.pm = pm_ptr(&tmag5273_pm_ops),
 	},
-	.probe_new = tmag5273_probe,
+	.probe = tmag5273_probe,
 	.id_table = tmag5273_id,
 };
 module_i2c_driver(tmag5273_driver);

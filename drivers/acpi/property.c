@@ -2,13 +2,16 @@
 /*
  * ACPI device specific properties support.
  *
- * Copyright (C) 2014, Intel Corporation
+ * Copyright (C) 2014 - 2023, Intel Corporation
  * All rights reserved.
  *
  * Authors: Mika Westerberg <mika.westerberg@linux.intel.com>
  *          Darren Hart <dvhart@linux.intel.com>
  *          Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+ *          Sakari Ailus <sakari.ailus@linux.intel.com>
  */
+
+#define pr_fmt(fmt) "ACPI: " fmt
 
 #include <linux/acpi.h>
 #include <linux/device.h>
@@ -55,6 +58,7 @@ static const guid_t ads_guid =
 	GUID_INIT(0xdbb8e3e6, 0x5886, 0x4ba6,
 		  0x87, 0x95, 0x13, 0x19, 0xf5, 0x2a, 0x96, 0x6b);
 
+/* ACPI _DSD data buffer GUID: edb12dd0-363d-4085-a3d2-49522ca160c4 */
 static const guid_t buffer_prop_guid =
 	GUID_INIT(0xedb12dd0, 0x363d, 0x4085,
 		  0xa3, 0xd2, 0x49, 0x52, 0x2c, 0xa1, 0x60, 0xc4);
@@ -800,27 +804,15 @@ static int acpi_get_ref_args(struct fwnode_reference_args *args,
 	u32 nargs = 0, i;
 
 	/*
-	 * Find the referred data extension node under the
-	 * referred device node.
-	 */
-	for (; *element < end && (*element)->type == ACPI_TYPE_STRING;
-	     (*element)++) {
-		const char *child_name = (*element)->string.pointer;
-
-		ref_fwnode = acpi_fwnode_get_named_child_node(ref_fwnode, child_name);
-		if (!ref_fwnode)
-			return -EINVAL;
-	}
-
-	/*
 	 * Assume the following integer elements are all args. Stop counting on
-	 * the first reference or end of the package arguments. In case of
-	 * neither reference, nor integer, return an error, we can't parse it.
+	 * the first reference (possibly represented as a string) or end of the
+	 * package arguments. In case of neither reference, nor integer, return
+	 * an error, we can't parse it.
 	 */
 	for (i = 0; (*element) + i < end && i < num_args; i++) {
 		acpi_object_type type = (*element)[i].type;
 
-		if (type == ACPI_TYPE_LOCAL_REFERENCE)
+		if (type == ACPI_TYPE_LOCAL_REFERENCE || type == ACPI_TYPE_STRING)
 			break;
 
 		if (type == ACPI_TYPE_INTEGER)
@@ -844,6 +836,44 @@ static int acpi_get_ref_args(struct fwnode_reference_args *args,
 	return 0;
 }
 
+static struct fwnode_handle *acpi_parse_string_ref(const struct fwnode_handle *fwnode,
+						   const char *refstring)
+{
+	acpi_handle scope, handle;
+	struct acpi_data_node *dn;
+	struct acpi_device *device;
+	acpi_status status;
+
+	if (is_acpi_device_node(fwnode)) {
+		scope = to_acpi_device_node(fwnode)->handle;
+	} else if (is_acpi_data_node(fwnode)) {
+		scope = to_acpi_data_node(fwnode)->handle;
+	} else {
+		pr_debug("Bad node type for node %pfw\n", fwnode);
+		return NULL;
+	}
+
+	status = acpi_get_handle(scope, refstring, &handle);
+	if (ACPI_FAILURE(status)) {
+		acpi_handle_debug(scope, "Unable to get an ACPI handle for %s\n",
+				  refstring);
+		return NULL;
+	}
+
+	device = acpi_fetch_acpi_dev(handle);
+	if (device)
+		return acpi_fwnode_handle(device);
+
+	status = acpi_get_data_full(handle, acpi_nondev_subnode_tag,
+				    (void **)&dn, NULL);
+	if (ACPI_FAILURE(status) || !dn) {
+		acpi_handle_debug(handle, "Subnode not found\n");
+		return NULL;
+	}
+
+	return &dn->fwnode;
+}
+
 /**
  * __acpi_node_get_property_reference - returns handle to the referenced object
  * @fwnode: Firmware node to get the property from
@@ -851,6 +881,7 @@ static int acpi_get_ref_args(struct fwnode_reference_args *args,
  * @index: Index of the reference to return
  * @num_args: Maximum number of arguments after each reference
  * @args: Location to store the returned reference with optional arguments
+ *	  (may be NULL)
  *
  * Find property with @name, verifify that it is a package containing at least
  * one object reference and if so, store the ACPI device object pointer to the
@@ -886,6 +917,7 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 	const union acpi_object *element, *end;
 	const union acpi_object *obj;
 	const struct acpi_device_data *data;
+	struct fwnode_handle *ref_fwnode;
 	struct acpi_device *device;
 	int ret, idx = 0;
 
@@ -907,18 +939,35 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 		if (!device)
 			return -EINVAL;
 
+		if (!args)
+			return 0;
+
 		args->fwnode = acpi_fwnode_handle(device);
 		args->nargs = 0;
+
+		return 0;
+	case ACPI_TYPE_STRING:
+		if (index)
+			return -ENOENT;
+
+		ref_fwnode = acpi_parse_string_ref(fwnode, obj->string.pointer);
+		if (!ref_fwnode)
+			return -EINVAL;
+
+		args->fwnode = ref_fwnode;
+		args->nargs = 0;
+
 		return 0;
 	case ACPI_TYPE_PACKAGE:
 		/*
 		 * If it is not a single reference, then it is a package of
-		 * references followed by number of ints as follows:
+		 * references, followed by number of ints as follows:
 		 *
 		 *  Package () { REF, INT, REF, INT, INT }
 		 *
-		 * The index argument is then used to determine which reference
-		 * the caller wants (along with the arguments).
+		 * Here, REF may be either a local reference or a string. The
+		 * index argument is then used to determine which reference the
+		 * caller wants (along with the arguments).
 		 */
 		break;
 	default:
@@ -950,6 +999,24 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 				return 0;
 
 			break;
+		case ACPI_TYPE_STRING:
+			ref_fwnode = acpi_parse_string_ref(fwnode,
+							   element->string.pointer);
+			if (!ref_fwnode)
+				return -EINVAL;
+
+			element++;
+
+			ret = acpi_get_ref_args(idx == index ? args : NULL,
+						ref_fwnode, &element, end,
+						num_args);
+			if (ret < 0)
+				return ret;
+
+			if (idx == index)
+				return 0;
+
+			break;
 		case ACPI_TYPE_INTEGER:
 			if (idx == index)
 				return -ENOENT;
@@ -971,60 +1038,48 @@ static int acpi_data_prop_read_single(const struct acpi_device_data *data,
 				      enum dev_prop_type proptype, void *val)
 {
 	const union acpi_object *obj;
-	int ret;
+	int ret = 0;
 
-	if (proptype >= DEV_PROP_U8 && proptype <= DEV_PROP_U64) {
+	if (proptype >= DEV_PROP_U8 && proptype <= DEV_PROP_U64)
 		ret = acpi_data_get_property(data, propname, ACPI_TYPE_INTEGER, &obj);
-		if (ret)
-			return ret;
-
-		switch (proptype) {
-		case DEV_PROP_U8:
-			if (obj->integer.value > U8_MAX)
-				return -EOVERFLOW;
-
-			if (val)
-				*(u8 *)val = obj->integer.value;
-
-			break;
-		case DEV_PROP_U16:
-			if (obj->integer.value > U16_MAX)
-				return -EOVERFLOW;
-
-			if (val)
-				*(u16 *)val = obj->integer.value;
-
-			break;
-		case DEV_PROP_U32:
-			if (obj->integer.value > U32_MAX)
-				return -EOVERFLOW;
-
-			if (val)
-				*(u32 *)val = obj->integer.value;
-
-			break;
-		default:
-			if (val)
-				*(u64 *)val = obj->integer.value;
-
-			break;
-		}
-
-		if (!val)
-			return 1;
-	} else if (proptype == DEV_PROP_STRING) {
+	else if (proptype == DEV_PROP_STRING)
 		ret = acpi_data_get_property(data, propname, ACPI_TYPE_STRING, &obj);
-		if (ret)
-			return ret;
+	if (ret)
+		return ret;
 
+	switch (proptype) {
+	case DEV_PROP_U8:
+		if (obj->integer.value > U8_MAX)
+			return -EOVERFLOW;
+		if (val)
+			*(u8 *)val = obj->integer.value;
+		break;
+	case DEV_PROP_U16:
+		if (obj->integer.value > U16_MAX)
+			return -EOVERFLOW;
+		if (val)
+			*(u16 *)val = obj->integer.value;
+		break;
+	case DEV_PROP_U32:
+		if (obj->integer.value > U32_MAX)
+			return -EOVERFLOW;
+		if (val)
+			*(u32 *)val = obj->integer.value;
+		break;
+	case DEV_PROP_U64:
+		if (val)
+			*(u64 *)val = obj->integer.value;
+		break;
+	case DEV_PROP_STRING:
 		if (val)
 			*(char **)val = obj->string.pointer;
-
 		return 1;
-	} else {
-		ret = -EINVAL;
+	default:
+		return -EINVAL;
 	}
-	return ret;
+
+	/* When no storage provided return number of available values */
+	return val ? 0 : 1;
 }
 
 #define acpi_copy_property_array_uint(items, val, nval)			\
@@ -1114,25 +1169,26 @@ static int acpi_data_prop_read(const struct acpi_device_data *data,
 	switch (proptype) {
 	case DEV_PROP_STRING:
 		break;
-	case DEV_PROP_U8 ... DEV_PROP_U64:
+	default:
 		if (obj->type == ACPI_TYPE_BUFFER) {
 			if (nval > obj->buffer.length)
 				return -EOVERFLOW;
-			break;
+		} else {
+			if (nval > obj->package.count)
+				return -EOVERFLOW;
 		}
-		fallthrough;
-	default:
-		if (nval > obj->package.count)
-			return -EOVERFLOW;
 		break;
 	}
 	if (nval == 0)
 		return -EINVAL;
 
-	if (obj->type != ACPI_TYPE_BUFFER)
-		items = obj->package.elements;
-	else
+	if (obj->type == ACPI_TYPE_BUFFER) {
+		if (proptype != DEV_PROP_U8)
+			return -EPROTO;
 		items = obj;
+	} else {
+		items = obj->package.elements;
+	}
 
 	switch (proptype) {
 	case DEV_PROP_U8:

@@ -162,6 +162,15 @@ struct sbconfig {
 #define	SRCI_SRBSZ_SHIFT	0
 #define SR_BSZ_BASE		14
 
+#define SYSMEM_SRCI_ROMNB_MASK		0x3e0
+#define SYSMEM_SRCI_ROMNB_SHIFT		5
+#define SYSMEM_SRCI_SRNB_MASK		0x1f
+#define SYSMEM_SRCI_SRNB_SHIFT		0
+#define SYSMEM_SRCI_NEW_ROMNB_MASK	0xff000000
+#define SYSMEM_SRCI_NEW_ROMNB_SHIFT	24
+#define SYSMEM_SRCI_NEW_SRNB_MASK	0xff0000
+#define SYSMEM_SRCI_NEW_SRNB_SHIFT	16
+
 struct sbsocramregs {
 	u32 coreinfo;
 	u32 bwalloc;
@@ -213,6 +222,7 @@ struct sbsocramregs {
 #define	ARMCR4_TCBANB_SHIFT	0
 
 #define	ARMCR4_BSZ_MASK		0x7f
+#define	ARMCR4_BSZ_MULT		8192
 #define	ARMCR4_BLK_1K_MASK	0x200
 
 struct brcmf_core_priv {
@@ -435,25 +445,11 @@ static void brcmf_chip_ai_resetcore(struct brcmf_core_priv *core, u32 prereset,
 {
 	struct brcmf_chip_priv *ci;
 	int count;
-	struct brcmf_core *d11core2 = NULL;
-	struct brcmf_core_priv *d11priv2 = NULL;
 
 	ci = core->chip;
 
-	/* special handle two D11 cores reset */
-	if (core->pub.id == BCMA_CORE_80211) {
-		d11core2 = brcmf_chip_get_d11core(&ci->pub, 1);
-		if (d11core2) {
-			brcmf_dbg(INFO, "found two d11 cores, reset both\n");
-			d11priv2 = container_of(d11core2,
-						struct brcmf_core_priv, pub);
-		}
-	}
-
 	/* must disable first to work for arbitrary current core state */
 	brcmf_chip_ai_coredisable(core, prereset, reset);
-	if (d11priv2)
-		brcmf_chip_ai_coredisable(d11priv2, prereset, reset);
 
 	count = 0;
 	while (ci->ops->read32(ci->ctx, core->wrapbase + BCMA_RESET_CTL) &
@@ -465,30 +461,9 @@ static void brcmf_chip_ai_resetcore(struct brcmf_core_priv *core, u32 prereset,
 		usleep_range(40, 60);
 	}
 
-	if (d11priv2) {
-		count = 0;
-		while (ci->ops->read32(ci->ctx,
-				       d11priv2->wrapbase + BCMA_RESET_CTL) &
-				       BCMA_RESET_CTL_RESET) {
-			ci->ops->write32(ci->ctx,
-					 d11priv2->wrapbase + BCMA_RESET_CTL,
-					 0);
-			count++;
-			if (count > 50)
-				break;
-			usleep_range(40, 60);
-		}
-	}
-
 	ci->ops->write32(ci->ctx, core->wrapbase + BCMA_IOCTL,
 			 postreset | BCMA_IOCTL_CLK);
 	ci->ops->read32(ci->ctx, core->wrapbase + BCMA_IOCTL);
-
-	if (d11priv2) {
-		ci->ops->write32(ci->ctx, d11priv2->wrapbase + BCMA_IOCTL,
-				 postreset | BCMA_IOCTL_CLK);
-		ci->ops->read32(ci->ctx, d11priv2->wrapbase + BCMA_IOCTL);
-	}
 }
 
 char *brcmf_chip_name(u32 id, u32 rev, char *buf, uint len)
@@ -658,6 +633,7 @@ static u32 brcmf_chip_sysmem_ramsize(struct brcmf_core_priv *sysmem)
 	u32 memsize = 0;
 	u32 coreinfo;
 	u32 idx;
+	u32 nrb;
 	u32 nb;
 	u32 banksize;
 
@@ -665,10 +641,16 @@ static u32 brcmf_chip_sysmem_ramsize(struct brcmf_core_priv *sysmem)
 		brcmf_chip_resetcore(&sysmem->pub, 0, 0, 0);
 
 	coreinfo = brcmf_chip_core_read32(sysmem, SYSMEMREGOFFS(coreinfo));
-	nb = (coreinfo & SRCI_SRNB_MASK) >> SRCI_SRNB_SHIFT;
+	if (sysmem->pub.rev >= 12) {
+		nrb = (coreinfo & SYSMEM_SRCI_NEW_ROMNB_MASK) >> SYSMEM_SRCI_NEW_ROMNB_SHIFT;
+		nb = (coreinfo & SYSMEM_SRCI_NEW_SRNB_MASK) >> SYSMEM_SRCI_NEW_SRNB_SHIFT;
+	} else {
+		nrb = (coreinfo & SYSMEM_SRCI_ROMNB_MASK) >> SYSMEM_SRCI_ROMNB_SHIFT;
+		nb = (coreinfo & SYSMEM_SRCI_SRNB_MASK) >> SYSMEM_SRCI_SRNB_SHIFT;
+	}
 
 	for (idx = 0; idx < nb; idx++) {
-		brcmf_chip_socram_banksize(sysmem, idx, &banksize);
+		brcmf_chip_socram_banksize(sysmem, idx + nrb, &banksize);
 		memsize += banksize;
 	}
 
@@ -676,8 +658,7 @@ static u32 brcmf_chip_sysmem_ramsize(struct brcmf_core_priv *sysmem)
 }
 
 /** Return the TCM-RAM size of the ARMCR4 core. */
-static u32 brcmf_chip_tcm_ramsize(struct brcmf_chip_priv *ci,
-				  struct brcmf_core_priv *cr4)
+static u32 brcmf_chip_tcm_ramsize(struct brcmf_core_priv *cr4)
 {
 	u32 corecap;
 	u32 memsize = 0;
@@ -697,10 +678,9 @@ static u32 brcmf_chip_tcm_ramsize(struct brcmf_chip_priv *ci,
 	for (idx = 0; idx < totb; idx++) {
 		brcmf_chip_core_write32(cr4, ARMCR4_BANKIDX, idx);
 		bxinfo = brcmf_chip_core_read32(cr4, ARMCR4_BANKINFO);
+		blksize = ARMCR4_BSZ_MULT;
 		if (bxinfo & ARMCR4_BLK_1K_MASK)
-			blksize = 1024;
-		else
-			blksize = 8192;
+			blksize >>= 3;
 
 		memsize += ((bxinfo & ARMCR4_BSZ_MASK) + 1) * blksize;
 	}
@@ -732,6 +712,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
 	case BRCM_CC_4366_CHIP_ID:
 	case BRCM_CC_43664_CHIP_ID:
 	case BRCM_CC_43666_CHIP_ID:
+	case BRCM_CC_4388_CHIP_ID:
 		return 0x200000;
 	case BRCM_CC_4355_CHIP_ID:
 	case BRCM_CC_4359_CHIP_ID:
@@ -763,7 +744,7 @@ int brcmf_chip_get_raminfo(struct brcmf_chip *pub)
 	mem = brcmf_chip_get_core(&ci->pub, BCMA_CORE_ARM_CR4);
 	if (mem) {
 		mem_core = container_of(mem, struct brcmf_core_priv, pub);
-		ci->pub.ramsize = brcmf_chip_tcm_ramsize(ci, mem_core);
+		ci->pub.ramsize = brcmf_chip_tcm_ramsize(mem_core);
 		ci->pub.rambase = brcmf_chip_tcm_rambase(ci);
 		if (ci->pub.rambase == INVALID_RAMBASE) {
 			brcmf_err("RAM base not provided with ARM CR4 core\n");
@@ -973,6 +954,7 @@ static int brcmf_chip_recognition(struct brcmf_chip_priv *ci)
 	u32 regdata;
 	u32 socitype;
 	int ret;
+	const u32 READ_FAILED = 0xFFFFFFFF;
 
 	/* Get CC core rev
 	 * Chipid is assume to be at offset 0 from SI_ENUM_BASE
@@ -981,6 +963,11 @@ static int brcmf_chip_recognition(struct brcmf_chip_priv *ci)
 	 */
 	regdata = ci->ops->read32(ci->ctx,
 				  CORE_CC_REG(ci->pub.enum_base, chipid));
+	if (regdata == READ_FAILED) {
+		brcmf_err("MMIO read failed: 0x%08x\n", regdata);
+		return -ENODEV;
+	}
+
 	ci->pub.chip = regdata & CID_ID_MASK;
 	ci->pub.chiprev = (regdata & CID_REV_MASK) >> CID_REV_SHIFT;
 	socitype = (regdata & CID_TYPE_MASK) >> CID_TYPE_SHIFT;
@@ -1332,14 +1319,15 @@ static inline void
 brcmf_chip_ca7_set_passive(struct brcmf_chip_priv *chip)
 {
 	struct brcmf_core *core;
+	int i;
 
 	brcmf_chip_disable_arm(chip, BCMA_CORE_ARM_CA7);
 
-	core = brcmf_chip_get_core(&chip->pub, BCMA_CORE_80211);
-	brcmf_chip_resetcore(core, D11_BCMA_IOCTL_PHYRESET |
-				   D11_BCMA_IOCTL_PHYCLOCKEN,
-			     D11_BCMA_IOCTL_PHYCLOCKEN,
-			     D11_BCMA_IOCTL_PHYCLOCKEN);
+	/* Disable the cores only and let the firmware enable them. */
+	for (i = 0; (core = brcmf_chip_get_d11core(&chip->pub, i)); i++)
+		brcmf_chip_coredisable(core, D11_BCMA_IOCTL_PHYRESET |
+				       D11_BCMA_IOCTL_PHYCLOCKEN,
+				       D11_BCMA_IOCTL_PHYCLOCKEN);
 }
 
 static bool brcmf_chip_ca7_set_active(struct brcmf_chip_priv *chip, u32 rstvec)

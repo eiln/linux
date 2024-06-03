@@ -27,6 +27,7 @@ void brcmf_acpi_probe(struct device *dev, enum brcmf_bus_type bus_type,
 						      o->string.pointer);
 	} else {
 		brcmf_dbg(INFO, "No ACPI module-instance\n");
+		return;
 	}
 
 	status = acpi_evaluate_object(adev->handle, "RWCV", NULL, &buf);
@@ -35,9 +36,7 @@ void brcmf_acpi_probe(struct device *dev, enum brcmf_bus_type bus_type,
 	    o->buffer.length >= 2) {
 		char *antenna_sku = devm_kzalloc(dev, 3, GFP_KERNEL);
 
-		if (!antenna_sku) {
-			brcmf_err("Failed to allocate antenna-sku");
-		} else {
+		if (antenna_sku) {
 			memcpy(antenna_sku, o->buffer.pointer, 2);
 			brcmf_dbg(INFO, "ACPI RWCV data=%*phN antenna-sku=%s\n",
 				  (int)o->buffer.length, o->buffer.pointer,

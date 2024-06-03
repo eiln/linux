@@ -13,8 +13,8 @@
 #include <linux/firmware.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/of_address.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/soc/qcom/mdt_loader.h>
@@ -74,6 +74,7 @@
 #define IPA_PAS_ID		15
 
 /* Shift of 19.2 MHz timestamp to achieve lower resolution timestamps */
+/* IPA v5.5+ does not specify Qtime timestamp config for DPL */
 #define DPL_TIMESTAMP_SHIFT	14	/* ~1.172 kHz, ~853 usec per tick */
 #define TAG_TIMESTAMP_SHIFT	14
 #define NAT_TIMESTAMP_SHIFT	24	/* ~1.144 Hz, ~874 msec per tick */
@@ -285,7 +286,7 @@ static void ipa_hardware_config_comp(struct ipa *ipa)
 	} else if (ipa->version < IPA_VERSION_4_5) {
 		val |= reg_bit(reg, GSI_MULTI_AXI_MASTERS_DIS);
 	} else {
-		/* For IPA v4.5 FULL_FLUSH_WAIT_RS_CLOSURE_EN is 0 */
+		/* For IPA v4.5+ FULL_FLUSH_WAIT_RS_CLOSURE_EN is 0 */
 	}
 
 	val |= reg_bit(reg, GSI_MULTI_INORDER_RD_DIS);
@@ -376,9 +377,11 @@ static void ipa_qtime_config(struct ipa *ipa)
 	iowrite32(0, ipa->reg_virt + reg_offset(reg));
 
 	reg = ipa_reg(ipa, QTIME_TIMESTAMP_CFG);
-	/* Set DPL time stamp resolution to use Qtime (instead of 1 msec) */
-	val = reg_encode(reg, DPL_TIMESTAMP_LSB, DPL_TIMESTAMP_SHIFT);
-	val |= reg_bit(reg, DPL_TIMESTAMP_SEL);
+	if (ipa->version < IPA_VERSION_5_5) {
+		/* Set DPL time stamp resolution to use Qtime (not 1 msec) */
+		val = reg_encode(reg, DPL_TIMESTAMP_LSB, DPL_TIMESTAMP_SHIFT);
+		val |= reg_bit(reg, DPL_TIMESTAMP_SEL);
+	}
 	/* Configure tag and NAT Qtime timestamp resolution as well */
 	val = reg_encode(reg, TAG_TIMESTAMP_LSB, TAG_TIMESTAMP_SHIFT);
 	val = reg_encode(reg, NAT_TIMESTAMP_LSB, NAT_TIMESTAMP_SHIFT);
@@ -684,6 +687,14 @@ static const struct of_device_id ipa_match[] = {
 		.compatible	= "qcom,sc7280-ipa",
 		.data		= &ipa_data_v4_11,
 	},
+	{
+		.compatible	= "qcom,sdx65-ipa",
+		.data		= &ipa_data_v5_0,
+	},
+	{
+		.compatible	= "qcom,sm8550-ipa",
+		.data		= &ipa_data_v5_5,
+	},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, ipa_match);
@@ -932,7 +943,7 @@ err_power_exit:
 	return ret;
 }
 
-static int ipa_remove(struct platform_device *pdev)
+static void ipa_remove(struct platform_device *pdev)
 {
 	struct ipa *ipa = dev_get_drvdata(&pdev->dev);
 	struct ipa_power *power = ipa->power;
@@ -955,8 +966,16 @@ static int ipa_remove(struct platform_device *pdev)
 			usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
 			ret = ipa_modem_stop(ipa);
 		}
-		if (ret)
-			return ret;
+		if (ret) {
+			/*
+			 * Not cleaning up here properly might also yield a
+			 * crash later on. As the device is still unregistered
+			 * in this case, this might even yield a crash later on.
+			 */
+			dev_err(dev, "Failed to stop modem (%pe), leaking resources\n",
+				ERR_PTR(ret));
+			return;
+		}
 
 		ipa_teardown(ipa);
 	}
@@ -974,17 +993,6 @@ out_power_put:
 	ipa_power_exit(power);
 
 	dev_info(dev, "IPA driver removed");
-
-	return 0;
-}
-
-static void ipa_shutdown(struct platform_device *pdev)
-{
-	int ret;
-
-	ret = ipa_remove(pdev);
-	if (ret)
-		dev_err(&pdev->dev, "shutdown: remove returned %d\n", ret);
 }
 
 static const struct attribute_group *ipa_attribute_groups[] = {
@@ -997,8 +1005,8 @@ static const struct attribute_group *ipa_attribute_groups[] = {
 
 static struct platform_driver ipa_driver = {
 	.probe		= ipa_probe,
-	.remove		= ipa_remove,
-	.shutdown	= ipa_shutdown,
+	.remove_new	= ipa_remove,
+	.shutdown	= ipa_remove,
 	.driver	= {
 		.name		= "ipa",
 		.pm		= &ipa_pm_ops,

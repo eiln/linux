@@ -211,6 +211,27 @@ const struct visl_ctrls visl_hevc_ctrls = {
 	.num_ctrls = ARRAY_SIZE(visl_hevc_ctrl_descs),
 };
 
+static const struct visl_ctrl_desc visl_av1_ctrl_descs[] = {
+	{
+		.cfg.id = V4L2_CID_STATELESS_AV1_FRAME,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY,
+		.cfg.dims = { V4L2_AV1_MAX_TILE_COUNT },
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_AV1_SEQUENCE,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_AV1_FILM_GRAIN,
+	},
+};
+
+const struct visl_ctrls visl_av1_ctrls = {
+	.ctrls = visl_av1_ctrl_descs,
+	.num_ctrls = ARRAY_SIZE(visl_av1_ctrl_descs),
+};
+
 struct v4l2_ctrl *visl_find_control(struct visl_ctx *ctx, u32 id)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
@@ -480,7 +501,7 @@ error_visl_dev:
 	return ret;
 }
 
-static int visl_remove(struct platform_device *pdev)
+static void visl_remove(struct platform_device *pdev)
 {
 	struct visl_dev *dev = platform_get_drvdata(pdev);
 
@@ -493,13 +514,11 @@ static int visl_remove(struct platform_device *pdev)
 	}
 #endif
 	video_unregister_device(&dev->vfd);
-
-	return 0;
 }
 
 static struct platform_driver visl_pdrv = {
 	.probe		= visl_probe,
-	.remove		= visl_remove,
+	.remove_new	= visl_remove,
 	.driver		= {
 		.name	= VISL_NAME,
 	},

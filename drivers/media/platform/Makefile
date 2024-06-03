@@ -8,6 +8,7 @@
 obj-y += allegro-dvt/
 obj-y += amlogic/
 obj-y += amphion/
+obj-y += apple/
 obj-y += aspeed/
 obj-y += atmel/
 obj-y += cadence/
@@ -16,6 +17,7 @@ obj-y += intel/
 obj-y += marvell/
 obj-y += mediatek/
 obj-y += microchip/
+obj-y += nuvoton/
 obj-y += nvidia/
 obj-y += nxp/
 obj-y += qcom/

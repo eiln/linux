@@ -4,7 +4,7 @@
 
 use super::channels;
 use super::types::*;
-use crate::{default_zeroed, no_debug, trivial_gpustruct};
+use crate::{default_zeroed, gem, no_debug, trivial_gpustruct};
 
 pub(crate) mod raw {
     use super::*;
@@ -443,6 +443,8 @@ pub(crate) mod raw {
 
         #[ver(V >= V13_3)]
         pub(crate) pad_bb8_0: Pad<0x200>,
+        #[ver(V >= V13_5)]
+        pub(crate) pad_bb8_200: Pad<0x8>,
 
         pub(crate) pad_bb8: Pad<0x74>,
         pub(crate) unk_c2c: u32,
@@ -589,8 +591,8 @@ pub(crate) mod raw {
     pub(crate) struct IOMapping {
         pub(crate) phys_addr: U64,
         pub(crate) virt_addr: U64,
-        pub(crate) size: u32,
-        pub(crate) range_size: u32,
+        pub(crate) total_size: u32,
+        pub(crate) element_size: u32,
         pub(crate) readwrite: U64,
     }
 
@@ -604,9 +606,13 @@ pub(crate) mod raw {
         {
             0x17
         }
-        #[ver(V >= V13_3)]
+        #[ver(V >= V13_3 && V < V13_5)]
         {
             0x18
+        }
+        #[ver(V >= V13_5)]
+        {
+            0x19
         }
     };
 
@@ -715,11 +721,12 @@ pub(crate) mod raw {
         pub(crate) unk_528: u32,
         pub(crate) unk_52c: u32,
         pub(crate) unk_530: u32,
-        pub(crate) unk_534: u32,
-        pub(crate) unk_538: u32,
 
         #[ver(V >= V13_0B4)]
-        pub(crate) unk_53c_0: u32,
+        pub(crate) unk_534_0: u32,
+
+        pub(crate) unk_534: u32,
+        pub(crate) unk_538: u32,
 
         pub(crate) num_frags: u32,
         pub(crate) unk_540: u32,
@@ -786,7 +793,7 @@ pub(crate) mod raw {
         pub(crate) pad_b10_0: Array<0x8, u8>,
 
         pub(crate) unk_b10: u32,
-        pub(crate) pad_b14: Pad<0x8>,
+        pub(crate) timer_offset: U64,
         pub(crate) unk_b1c: u32,
         pub(crate) unk_b20: u32,
         pub(crate) unk_b24: u32,
@@ -813,6 +820,12 @@ pub(crate) mod raw {
         #[ver(G >= G14X)]
         pub(crate) unk_c3c_0: Array<0x8, u8>,
 
+        #[ver(G < G14X && V >= V13_5)]
+        pub(crate) unk_c3c_8: Array<0x10, u8>,
+
+        #[ver(V >= V13_5)]
+        pub(crate) unk_c3c_18: Array<0x20, u8>,
+
         #[ver(V >= V13_0B4)]
         pub(crate) unk_c3c: u32,
     }
@@ -827,13 +840,35 @@ pub(crate) mod raw {
     }
     default_zeroed!(GpuStatsVtx);
 
+    #[versions(AGX)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct GpuStatsFrag {
         // This changes all the time and we don't use it, let's just make it a big buffer
-        pub(crate) opaque: Array<0x3000, u8>,
+        // except for these two fields which may need init.
+        #[ver(G >= G14X)]
+        pub(crate) unk1_0: Array<0x910, u8>,
+        pub(crate) unk1: Array<0x100, u8>,
+        pub(crate) cur_stamp_id: i32,
+        pub(crate) unk2: Array<0x14, u8>,
+        pub(crate) unk_id: i32,
+        pub(crate) unk3: Array<0x1000, u8>,
     }
-    default_zeroed!(GpuStatsFrag);
+
+    #[versions(AGX)]
+    impl Default for GpuStatsFrag::ver {
+        fn default() -> Self {
+            Self {
+                #[ver(G >= G14X)]
+                unk1_0: Default::default(),
+                unk1: Default::default(),
+                cur_stamp_id: -1,
+                unk2: Default::default(),
+                unk_id: -1,
+                unk3: Default::default(),
+            }
+        }
+    }
 
     #[derive(Debug)]
     #[repr(C)]
@@ -843,14 +878,14 @@ pub(crate) mod raw {
     }
     default_zeroed!(GpuGlobalStatsVtx);
 
-    #[derive(Debug)]
+    #[versions(AGX)]
+    #[derive(Debug, Default)]
     #[repr(C)]
     pub(crate) struct GpuGlobalStatsFrag {
         pub(crate) total_cmds: u32,
         pub(crate) unk_4: u32,
-        pub(crate) stats: GpuStatsFrag,
+        pub(crate) stats: GpuStatsFrag::ver,
     }
-    default_zeroed!(GpuGlobalStatsFrag);
 
     #[derive(Debug)]
     #[repr(C)]
@@ -904,8 +939,6 @@ pub(crate) mod raw {
     #[versions(AGX)]
     default_zeroed!(RuntimeScratch::ver);
 
-    pub(crate) type BufferMgrCtl = Array<4, u32>;
-
     #[versions(AGX)]
     #[repr(C)]
     pub(crate) struct RuntimePointers<'a> {
@@ -922,7 +955,7 @@ pub(crate) mod raw {
         pub(crate) unk_160: U64,
         pub(crate) unk_168: U64,
         pub(crate) stats_vtx: GpuPointer<'a, super::GpuGlobalStatsVtx>,
-        pub(crate) stats_frag: GpuPointer<'a, super::GpuGlobalStatsFrag>,
+        pub(crate) stats_frag: GpuPointer<'a, super::GpuGlobalStatsFrag::ver>,
         pub(crate) stats_comp: GpuPointer<'a, super::GpuStatsComp>,
         pub(crate) hwdata_a: GpuPointer<'a, super::HwDataA::ver>,
         pub(crate) unkptr_190: GpuPointer<'a, &'a [u8]>,
@@ -940,8 +973,8 @@ pub(crate) mod raw {
         pub(crate) unk_1d0: u32,
         pub(crate) unk_1d4: u32,
         pub(crate) unk_1d8: Array<0x3c, u8>,
-        pub(crate) buffer_mgr_ctl: GpuPointer<'a, &'a [BufferMgrCtl]>,
-        pub(crate) buffer_mgr_ctl_2: GpuPointer<'a, &'a [BufferMgrCtl]>,
+        pub(crate) buffer_mgr_ctl_gpu_addr: U64,
+        pub(crate) buffer_mgr_ctl_fw_addr: U64,
         pub(crate) __pad1: Pad<0x5c>,
         pub(crate) gpu_scratch: RuntimeScratch::ver,
     }
@@ -1088,7 +1121,7 @@ pub(crate) mod raw {
         pub(crate) hws2: HwDataShared2,
 
         #[ver(V >= V13_0B4)]
-        pub(crate) unk_hws2_0: u32,
+        pub(crate) idle_off_standby_timer: u32,
 
         #[ver(V >= V13_0B4)]
         pub(crate) unk_hws2_4: Array<0x8, F32>,
@@ -1116,9 +1149,11 @@ pub(crate) mod raw {
         pub(crate) unk_10e50: u32,
         pub(crate) unk_10e54: Array<0x2c, u8>,
 
-        #[ver(G >= G14X && V < V13_3 || G <= G14 && V >= V13_3)]
+        #[ver((G >= G14X && V < V13_3) || (G <= G14 && V >= V13_3))]
         pub(crate) unk_x_pad: Array<0x4, u8>,
 
+        // bit 0: sets sgx_reg 0x17620
+        // bit 1: sets sgx_reg 0x17630
         pub(crate) fault_control: u32,
         pub(crate) do_init: u32,
         pub(crate) unk_10e88: Array<0x188, u8>,
@@ -1147,10 +1182,10 @@ pub(crate) mod raw {
         pub(crate) idle_off_delay_ms: AtomicU32,
         pub(crate) fender_idle_off_delay_ms: u32,
         pub(crate) fw_early_wake_timeout_ms: u32,
-        #[ver(V >= V13_3)]
+        #[ver(V == V13_3)]
         pub(crate) ps_pad_0: Pad<0x8>,
         pub(crate) pending_stamps: Array<0x100, PendingStamp>,
-        #[ver(V < V13_3)]
+        #[ver(V != V13_3)]
         pub(crate) ps_pad_0: Pad<0x8>,
         pub(crate) unkpad_ps: Pad<0x78>,
         pub(crate) unk_117bc: u32,
@@ -1172,7 +1207,7 @@ pub(crate) mod raw {
         #[ver(V >= V13_0B4)]
         pub(crate) unk_118e4_0: u32,
 
-        pub(crate) unk_118e4: u32,
+        pub(crate) cdm_context_store_latency_threshold: u32,
         pub(crate) unk_118e8: u32,
         pub(crate) unk_118ec: Array<0x400, u8>,
         pub(crate) unk_11cec: Array<0x54, u8>,
@@ -1258,7 +1293,8 @@ where
 
 trivial_gpustruct!(FwStatus);
 trivial_gpustruct!(GpuGlobalStatsVtx);
-trivial_gpustruct!(GpuGlobalStatsFrag);
+#[versions(AGX)]
+trivial_gpustruct!(GpuGlobalStatsFrag::ver);
 trivial_gpustruct!(GpuStatsComp);
 
 #[versions(AGX)]
@@ -1271,7 +1307,7 @@ trivial_gpustruct!(HwDataB::ver);
 #[derive(Debug)]
 pub(crate) struct Stats {
     pub(crate) vtx: GpuObject<GpuGlobalStatsVtx>,
-    pub(crate) frag: GpuObject<GpuGlobalStatsFrag>,
+    pub(crate) frag: GpuObject<GpuGlobalStatsFrag::ver>,
     pub(crate) comp: GpuObject<GpuStatsComp>,
 }
 
@@ -1289,7 +1325,7 @@ pub(crate) struct RuntimePointers {
     pub(crate) unkptr_1c0: GpuArray<u8>,
     pub(crate) unkptr_1c8: GpuArray<u8>,
 
-    pub(crate) buffer_mgr_ctl: GpuArray<raw::BufferMgrCtl>,
+    pub(crate) buffer_mgr_ctl: gem::ObjectRef,
 }
 
 #[versions(AGX)]

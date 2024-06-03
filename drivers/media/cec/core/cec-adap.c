@@ -385,8 +385,8 @@ static void cec_data_cancel(struct cec_data *data, u8 tx_status, u8 rx_status)
 	cec_queue_msg_monitor(adap, &data->msg, 1);
 
 	if (!data->blocking && data->msg.sequence)
-		/* Allow drivers to process the message first */
-		call_op(adap, received, &data->msg);
+		/* Allow drivers to react to a canceled transmit */
+		call_void_op(adap, adap_nb_transmit_canceled, &data->msg);
 
 	cec_data_completed(data);
 }
@@ -511,7 +511,7 @@ int cec_thread_func(void *_adap)
 				pr_warn("cec-%s: transmit timed out\n", adap->name);
 			}
 			adap->transmit_in_progress = false;
-			adap->tx_timeouts++;
+			adap->tx_timeout_cnt++;
 			goto unlock;
 		}
 
@@ -624,6 +624,33 @@ void cec_transmit_done_ts(struct cec_adapter *adap, u8 status,
 	msg->tx_nack_cnt += nack_cnt;
 	msg->tx_low_drive_cnt += low_drive_cnt;
 	msg->tx_error_cnt += error_cnt;
+
+	adap->tx_arb_lost_cnt += arb_lost_cnt;
+	adap->tx_low_drive_cnt += low_drive_cnt;
+	adap->tx_error_cnt += error_cnt;
+
+	/*
+	 * Low Drive transmission errors should really not happen for
+	 * well-behaved CEC devices and proper HDMI cables.
+	 *
+	 * Ditto for the 'Error' status.
+	 *
+	 * For the first few times that this happens, log this.
+	 * Stop logging after that, since that will not add any more
+	 * useful information and instead it will just flood the kernel log.
+	 */
+	if (done && adap->tx_low_drive_log_cnt < 8 && msg->tx_low_drive_cnt) {
+		adap->tx_low_drive_log_cnt++;
+		dprintk(0, "low drive counter: %u (seq %u: %*ph)\n",
+			msg->tx_low_drive_cnt, msg->sequence,
+			msg->len, msg->msg);
+	}
+	if (done && adap->tx_error_log_cnt < 8 && msg->tx_error_cnt) {
+		adap->tx_error_log_cnt++;
+		dprintk(0, "error counter: %u (seq %u: %*ph)\n",
+			msg->tx_error_cnt, msg->sequence,
+			msg->len, msg->msg);
+	}
 
 	/* Mark that we're done with this transmit */
 	adap->transmitting = NULL;
@@ -1052,6 +1079,7 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 	u8 cmd = msg->msg[1];
 	bool is_reply = false;
 	bool valid_la = true;
+	bool monitor_valid_la = true;
 	u8 min_len = 0;
 
 	if (WARN_ON(!msg->len || msg->len > CEC_MAX_MSG_SIZE))
@@ -1090,11 +1118,14 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 	mutex_lock(&adap->lock);
 	dprintk(2, "%s: %*ph\n", __func__, msg->len, msg->msg);
 
-	adap->last_initiator = 0xff;
+	if (!adap->transmit_in_progress)
+		adap->last_initiator = 0xff;
 
 	/* Check if this message was for us (directed or broadcast). */
-	if (!cec_msg_is_broadcast(msg))
+	if (!cec_msg_is_broadcast(msg)) {
 		valid_la = cec_has_log_addr(adap, msg_dest);
+		monitor_valid_la = valid_la;
+	}
 
 	/*
 	 * Check if the length is not too short or if the message is a
@@ -1227,7 +1258,7 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 	mutex_unlock(&adap->lock);
 
 	/* Pass the message on to any monitoring filehandles */
-	cec_queue_msg_monitor(adap, msg, valid_la);
+	cec_queue_msg_monitor(adap, msg, monitor_valid_la);
 
 	/* We're done if it is not for us or a poll message */
 	if (!valid_la || msg->len <= 1)
@@ -1344,7 +1375,7 @@ static void cec_adap_unconfigure(struct cec_adapter *adap)
 	cec_flush(adap);
 	wake_up_interruptible(&adap->kthread_waitq);
 	cec_post_state_event(adap);
-	call_void_op(adap, adap_configured, false);
+	call_void_op(adap, adap_unconfigured);
 }
 
 /*
@@ -1535,7 +1566,7 @@ configured:
 	adap->kthread_config = NULL;
 	complete(&adap->config_completion);
 	mutex_unlock(&adap->lock);
-	call_void_op(adap, adap_configured, true);
+	call_void_op(adap, configured);
 	return 0;
 
 unconfigure:
@@ -1582,7 +1613,7 @@ static void cec_claim_log_addrs(struct cec_adapter *adap, bool block)
  *
  * This function is called with adap->lock held.
  */
-static int cec_adap_enable(struct cec_adapter *adap)
+int cec_adap_enable(struct cec_adapter *adap)
 {
 	bool enable;
 	int ret = 0;
@@ -1592,6 +1623,9 @@ static int cec_adap_enable(struct cec_adapter *adap)
 	if (adap->needs_hpd)
 		enable = enable && adap->phys_addr != CEC_PHYS_ADDR_INVALID;
 
+	if (adap->devnode.unregistered)
+		enable = false;
+
 	if (enable == adap->is_enabled)
 		return 0;
 
@@ -1600,6 +1634,8 @@ static int cec_adap_enable(struct cec_adapter *adap)
 	if (enable) {
 		adap->last_initiator = 0xff;
 		adap->transmit_in_progress = false;
+		adap->tx_low_drive_log_cnt = 0;
+		adap->tx_error_log_cnt = 0;
 		ret = adap->ops->adap_enable(adap, true);
 		if (!ret) {
 			/*
@@ -1681,6 +1717,11 @@ void cec_s_phys_addr(struct cec_adapter *adap, u16 phys_addr, bool block)
 }
 EXPORT_SYMBOL_GPL(cec_s_phys_addr);
 
+/*
+ * Note: In the drm subsystem, prefer calling (if possible):
+ *
+ * cec_s_phys_addr(adap, connector->display_info.source_physical_address, false);
+ */
 void cec_s_phys_addr_from_edid(struct cec_adapter *adap,
 			       const struct edid *edid)
 {
@@ -2253,10 +2294,25 @@ int cec_adap_status(struct seq_file *file, void *priv)
 	if (adap->monitor_pin_cnt)
 		seq_printf(file, "file handles in Monitor Pin mode: %u\n",
 			   adap->monitor_pin_cnt);
-	if (adap->tx_timeouts) {
-		seq_printf(file, "transmit timeouts: %u\n",
-			   adap->tx_timeouts);
-		adap->tx_timeouts = 0;
+	if (adap->tx_timeout_cnt) {
+		seq_printf(file, "transmit timeout count: %u\n",
+			   adap->tx_timeout_cnt);
+		adap->tx_timeout_cnt = 0;
+	}
+	if (adap->tx_low_drive_cnt) {
+		seq_printf(file, "transmit low drive count: %u\n",
+			   adap->tx_low_drive_cnt);
+		adap->tx_low_drive_cnt = 0;
+	}
+	if (adap->tx_arb_lost_cnt) {
+		seq_printf(file, "transmit arbitration lost count: %u\n",
+			   adap->tx_arb_lost_cnt);
+		adap->tx_arb_lost_cnt = 0;
+	}
+	if (adap->tx_error_cnt) {
+		seq_printf(file, "transmit error count: %u\n",
+			   adap->tx_error_cnt);
+		adap->tx_error_cnt = 0;
 	}
 	data = adap->transmitting;
 	if (data)

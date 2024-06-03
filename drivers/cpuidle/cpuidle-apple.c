@@ -19,6 +19,7 @@ enum idle_state {
 };
 
 asm(
+	".pushsection .cpuidle.text, \"ax\"\n"
 	".type apple_cpu_deep_wfi, @function\n"
 	"apple_cpu_deep_wfi:\n"
 		"str x30, [sp, #-16]!\n"
@@ -53,9 +54,16 @@ asm(
 		"ldr x30, [sp], #16\n"
 
 		"ret\n"
+	".popsection\n"
 );
 
 void apple_cpu_deep_wfi(void);
+
+static __cpuidle int apple_enter_wfi(struct cpuidle_device *dev, struct cpuidle_driver *drv, int index)
+{
+	cpu_do_idle();
+	return index;
+}
 
 static __cpuidle int apple_enter_idle(struct cpuidle_device *dev, struct cpuidle_driver *drv, int index)
 {
@@ -67,10 +75,9 @@ static __cpuidle int apple_enter_idle(struct cpuidle_device *dev, struct cpuidle
 	if (cpu_pm_enter())
 		return -1;
 
+	ct_cpuidle_enter();
+
 	switch(index) {
-	case STATE_WFI:
-		cpu_do_idle();
-		break;
 	case STATE_PWRDOWN:
 		apple_cpu_deep_wfi();
 		break;
@@ -78,6 +85,8 @@ static __cpuidle int apple_enter_idle(struct cpuidle_device *dev, struct cpuidle
 		WARN_ON(1);
 		break;
 	}
+
+	ct_cpuidle_exit();
 
 	cpu_pm_exit();
 
@@ -89,13 +98,14 @@ static struct cpuidle_driver apple_idle_driver = {
 	.owner = THIS_MODULE,
 	.states = {
 		[STATE_WFI] = {
-			.enter			= apple_enter_idle,
-			.enter_s2idle		= apple_enter_idle,
+			.enter			= apple_enter_wfi,
+			.enter_s2idle		= apple_enter_wfi,
 			.exit_latency		= 1,
 			.target_residency	= 1,
 			.power_usage            = UINT_MAX,
 			.name			= "WFI",
 			.desc			= "CPU clock-gated",
+			.flags			= 0,
 		},
 		[STATE_PWRDOWN] = {
 			.enter			= apple_enter_idle,
@@ -105,6 +115,7 @@ static struct cpuidle_driver apple_idle_driver = {
 			.power_usage            = 0,
 			.name			= "CPU PD",
 			.desc			= "CPU/cluster powered down",
+			.flags			= CPUIDLE_FLAG_RCU_IDLE,
 		},
 	},
 	.safe_state_index = STATE_WFI,

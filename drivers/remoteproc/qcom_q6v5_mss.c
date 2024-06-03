@@ -15,9 +15,9 @@
 #include <linux/kernel.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -71,6 +71,7 @@
 #define QDSP6SS_MEM_PWR_CTL		0x0B0
 #define QDSP6V6SS_MEM_PWR_CTL		0x034
 #define QDSP6SS_STRAP_ACC		0x110
+#define QDSP6V62SS_BHS_STATUS		0x0C4
 
 /* AXI Halt Register Offsets */
 #define AXI_HALTREQ_REG			0x0
@@ -123,6 +124,7 @@
 #define QDSP6v56_CLAMP_QMC_MEM		BIT(22)
 #define QDSP6SS_XO_CBCR		0x0038
 #define QDSP6SS_ACC_OVERRIDE_VAL		0x20
+#define QDSP6v55_BHS_EN_REST_ACK	BIT(0)
 
 /* QDSP6v65 parameters */
 #define QDSP6SS_CORE_CBCR		0x20
@@ -130,6 +132,7 @@
 #define QDSP6SS_BOOT_CORE_START         0x400
 #define QDSP6SS_BOOT_CMD                0x404
 #define BOOT_FSM_TIMEOUT                10000
+#define BHS_CHECK_MAX_LOOPS             200
 
 struct reg_info {
 	struct regulator *reg;
@@ -235,8 +238,8 @@ struct q6v5 {
 	bool has_qaccept_regs;
 	bool has_ext_cntl_regs;
 	bool has_vq6;
-	int mpss_perm;
-	int mba_perm;
+	u64 mpss_perm;
+	u64 mba_perm;
 	const char *hexagon_mdt_image;
 	int version;
 };
@@ -250,6 +253,7 @@ enum {
 	MSS_MSM8998,
 	MSS_SC7180,
 	MSS_SC7280,
+	MSS_SDM660,
 	MSS_SDM845,
 };
 
@@ -414,7 +418,7 @@ static void q6v5_pds_disable(struct q6v5 *qproc, struct device **pds,
 	}
 }
 
-static int q6v5_xfer_mem_ownership(struct q6v5 *qproc, int *current_perm,
+static int q6v5_xfer_mem_ownership(struct q6v5 *qproc, u64 *current_perm,
 				   bool local, bool remote, phys_addr_t addr,
 				   size_t size)
 {
@@ -700,7 +704,8 @@ static int q6v5proc_reset(struct q6v5 *qproc)
 	} else if (qproc->version == MSS_MSM8909 ||
 		   qproc->version == MSS_MSM8953 ||
 		   qproc->version == MSS_MSM8996 ||
-		   qproc->version == MSS_MSM8998) {
+		   qproc->version == MSS_MSM8998 ||
+		   qproc->version == MSS_SDM660) {
 
 		if (qproc->version != MSS_MSM8909 &&
 		    qproc->version != MSS_MSM8953)
@@ -734,6 +739,16 @@ static int q6v5proc_reset(struct q6v5 *qproc)
 		val |= readl(qproc->reg_base + QDSP6SS_PWR_CTL_REG);
 		udelay(1);
 
+		if (qproc->version == MSS_SDM660) {
+			ret = readl_relaxed_poll_timeout(qproc->reg_base + QDSP6V62SS_BHS_STATUS,
+							 i, (i & QDSP6v55_BHS_EN_REST_ACK),
+							 1, BHS_CHECK_MAX_LOOPS);
+			if (ret == -ETIMEDOUT) {
+				dev_err(qproc->dev, "BHS_EN_REST_ACK not set!\n");
+				return -ETIMEDOUT;
+			}
+		}
+
 		/* Put LDO in bypass mode */
 		val |= QDSP6v56_LDO_BYP;
 		writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
@@ -756,7 +771,7 @@ static int q6v5proc_reset(struct q6v5 *qproc)
 				mem_pwr_ctl = QDSP6SS_MEM_PWR_CTL;
 				i = 19;
 			} else {
-				/* MSS_MSM8998 */
+				/* MSS_MSM8998, MSS_SDM660 */
 				mem_pwr_ctl = QDSP6V6SS_MEM_PWR_CTL;
 				i = 28;
 			}
@@ -967,7 +982,7 @@ static int q6v5_mpss_init_image(struct q6v5 *qproc, const struct firmware *fw,
 	unsigned long dma_attrs = DMA_ATTR_FORCE_CONTIGUOUS;
 	dma_addr_t phys;
 	void *metadata;
-	int mdata_perm;
+	u64 mdata_perm;
 	int xferop_ret;
 	size_t size;
 	void *ptr;
@@ -1562,7 +1577,7 @@ static void qcom_q6v5_dump_segment(struct rproc *rproc,
 
 static int q6v5_start(struct rproc *rproc)
 {
-	struct q6v5 *qproc = (struct q6v5 *)rproc->priv;
+	struct q6v5 *qproc = rproc->priv;
 	int xfermemop_ret;
 	int ret;
 
@@ -1604,7 +1619,7 @@ reclaim_mpss:
 
 static int q6v5_stop(struct rproc *rproc)
 {
-	struct q6v5 *qproc = (struct q6v5 *)rproc->priv;
+	struct q6v5 *qproc = rproc->priv;
 	int ret;
 
 	ret = qcom_q6v5_request_stop(&qproc->q6v5, qproc->sysmon);
@@ -1662,7 +1677,7 @@ static int qcom_q6v5_register_dump_segments(struct rproc *rproc,
 
 static unsigned long q6v5_panic(struct rproc *rproc)
 {
-	struct q6v5 *qproc = (struct q6v5 *)rproc->priv;
+	struct q6v5 *qproc = rproc->priv;
 
 	return qcom_q6v5_panic(&qproc->q6v5);
 }
@@ -1875,8 +1890,6 @@ static int q6v5_alloc_memory_region(struct q6v5 *qproc)
 	struct device_node *child;
 	struct reserved_mem *rmem;
 	struct device_node *node;
-	struct resource r;
-	int ret;
 
 	/*
 	 * In the absence of mba/mpss sub-child, extract the mba and mpss
@@ -1891,15 +1904,20 @@ static int q6v5_alloc_memory_region(struct q6v5 *qproc)
 		of_node_put(child);
 	}
 
-	ret = of_address_to_resource(node, 0, &r);
-	of_node_put(node);
-	if (ret) {
-		dev_err(qproc->dev, "unable to resolve mba region\n");
-		return ret;
+	if (!node) {
+		dev_err(qproc->dev, "no mba memory-region specified\n");
+		return -EINVAL;
 	}
 
-	qproc->mba_phys = r.start;
-	qproc->mba_size = resource_size(&r);
+	rmem = of_reserved_mem_lookup(node);
+	of_node_put(node);
+	if (!rmem) {
+		dev_err(qproc->dev, "unable to resolve mba region\n");
+		return -EINVAL;
+	}
+
+	qproc->mba_phys = rmem->base;
+	qproc->mba_size = rmem->size;
 
 	if (!child) {
 		node = of_parse_phandle(qproc->dev->of_node,
@@ -1910,15 +1928,20 @@ static int q6v5_alloc_memory_region(struct q6v5 *qproc)
 		of_node_put(child);
 	}
 
-	ret = of_address_to_resource(node, 0, &r);
-	of_node_put(node);
-	if (ret) {
-		dev_err(qproc->dev, "unable to resolve mpss region\n");
-		return ret;
+	if (!node) {
+		dev_err(qproc->dev, "no mpss memory-region specified\n");
+		return -EINVAL;
 	}
 
-	qproc->mpss_phys = qproc->mpss_reloc = r.start;
-	qproc->mpss_size = resource_size(&r);
+	rmem = of_reserved_mem_lookup(node);
+	of_node_put(node);
+	if (!rmem) {
+		dev_err(qproc->dev, "unable to resolve mpss region\n");
+		return -EINVAL;
+	}
+
+	qproc->mpss_phys = qproc->mpss_reloc = rmem->base;
+	qproc->mpss_size = rmem->size;
 
 	if (!child) {
 		node = of_parse_phandle(qproc->dev->of_node, "memory-region", 2);
@@ -1977,7 +2000,7 @@ static int q6v5_probe(struct platform_device *pdev)
 	rproc->auto_boot = false;
 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
 
-	qproc = (struct q6v5 *)rproc->priv;
+	qproc = rproc->priv;
 	qproc->dev = &pdev->dev;
 	qproc->rproc = rproc;
 	qproc->hexagon_mdt_image = "modem.mdt";
@@ -2110,7 +2133,7 @@ free_rproc:
 	return ret;
 }
 
-static int q6v5_remove(struct platform_device *pdev)
+static void q6v5_remove(struct platform_device *pdev)
 {
 	struct q6v5 *qproc = platform_get_drvdata(pdev);
 	struct rproc *rproc = qproc->rproc;
@@ -2128,8 +2151,6 @@ static int q6v5_remove(struct platform_device *pdev)
 	q6v5_pds_detach(qproc, qproc->proxy_pds, qproc->proxy_pd_count);
 
 	rproc_free(rproc);
-
-	return 0;
 }
 
 static const struct rproc_hexagon_res sc7180_mss = {
@@ -2191,6 +2212,37 @@ static const struct rproc_hexagon_res sc7280_mss = {
 	.has_ext_cntl_regs = true,
 	.has_vq6 = true,
 	.version = MSS_SC7280,
+};
+
+static const struct rproc_hexagon_res sdm660_mss = {
+	.hexagon_mba_image = "mba.mbn",
+	.proxy_clk_names = (char*[]){
+			"xo",
+			"qdss",
+			"mem",
+			NULL
+	},
+	.active_clk_names = (char*[]){
+			"iface",
+			"bus",
+			"gpll0_mss",
+			"mnoc_axi",
+			"snoc_axi",
+			NULL
+	},
+	.proxy_pd_names = (char*[]){
+			"cx",
+			"mx",
+			NULL
+	},
+	.need_mem_protection = true,
+	.has_alt_reset = false,
+	.has_mba_logs = false,
+	.has_spare_reg = false,
+	.has_qaccept_regs = false,
+	.has_ext_cntl_regs = false,
+	.has_vq6 = false,
+	.version = MSS_SDM660,
 };
 
 static const struct rproc_hexagon_res sdm845_mss = {
@@ -2270,7 +2322,6 @@ static const struct rproc_hexagon_res msm8996_mss = {
 	},
 	.proxy_clk_names = (char*[]){
 			"xo",
-			"pnoc",
 			"qdss",
 			NULL
 	},
@@ -2475,6 +2526,7 @@ static const struct of_device_id q6v5_of_match[] = {
 	{ .compatible = "qcom,msm8998-mss-pil", .data = &msm8998_mss},
 	{ .compatible = "qcom,sc7180-mss-pil", .data = &sc7180_mss},
 	{ .compatible = "qcom,sc7280-mss-pil", .data = &sc7280_mss},
+	{ .compatible = "qcom,sdm660-mss-pil", .data = &sdm660_mss},
 	{ .compatible = "qcom,sdm845-mss-pil", .data = &sdm845_mss},
 	{ },
 };
@@ -2482,7 +2534,7 @@ MODULE_DEVICE_TABLE(of, q6v5_of_match);
 
 static struct platform_driver q6v5_driver = {
 	.probe = q6v5_probe,
-	.remove = q6v5_remove,
+	.remove_new = q6v5_remove,
 	.driver = {
 		.name = "qcom-q6v5-mss",
 		.of_match_table = q6v5_of_match,

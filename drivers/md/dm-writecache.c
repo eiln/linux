@@ -299,7 +299,7 @@ static int persistent_memory_claim(struct dm_writecache *wc)
 		long i;
 
 		wc->memory_map = NULL;
-		pages = kvmalloc_array(p, sizeof(struct page *), GFP_KERNEL);
+		pages = vmalloc_array(p, sizeof(struct page *));
 		if (!pages) {
 			r = -ENOMEM;
 			goto err2;
@@ -330,7 +330,7 @@ static int persistent_memory_claim(struct dm_writecache *wc)
 			r = -ENOMEM;
 			goto err3;
 		}
-		kvfree(pages);
+		vfree(pages);
 		wc->memory_vmapped = true;
 	}
 
@@ -341,7 +341,7 @@ static int persistent_memory_claim(struct dm_writecache *wc)
 
 	return 0;
 err3:
-	kvfree(pages);
+	vfree(pages);
 err2:
 	dax_read_unlock(id);
 err1:
@@ -962,7 +962,7 @@ static int writecache_alloc_entries(struct dm_writecache *wc)
 
 	if (wc->entries)
 		return 0;
-	wc->entries = vmalloc(array_size(sizeof(struct wc_entry), wc->n_blocks));
+	wc->entries = vmalloc_array(wc->n_blocks, sizeof(struct wc_entry));
 	if (!wc->entries)
 		return -ENOMEM;
 	for (b = 0; b < wc->n_blocks; b++) {
@@ -2773,27 +2773,7 @@ static struct target_type writecache_target = {
 	.iterate_devices	= writecache_iterate_devices,
 	.io_hints		= writecache_io_hints,
 };
-
-static int __init dm_writecache_init(void)
-{
-	int r;
-
-	r = dm_register_target(&writecache_target);
-	if (r < 0) {
-		DMERR("register failed %d", r);
-		return r;
-	}
-
-	return 0;
-}
-
-static void __exit dm_writecache_exit(void)
-{
-	dm_unregister_target(&writecache_target);
-}
-
-module_init(dm_writecache_init);
-module_exit(dm_writecache_exit);
+module_dm(writecache);
 
 MODULE_DESCRIPTION(DM_NAME " writecache target");
 MODULE_AUTHOR("Mikulas Patocka <dm-devel@redhat.com>");

@@ -192,7 +192,7 @@ static int apple_wdt_probe(struct platform_device *pdev)
 	return devm_watchdog_register_device(dev, &wdt->wdd);
 }
 
-static int __maybe_unused apple_wdt_resume(struct device *dev)
+static int apple_wdt_resume(struct device *dev)
 {
 	struct apple_wdt *wdt = dev_get_drvdata(dev);
 
@@ -202,7 +202,7 @@ static int __maybe_unused apple_wdt_resume(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused apple_wdt_suspend(struct device *dev)
+static int apple_wdt_suspend(struct device *dev)
 {
 	struct apple_wdt *wdt = dev_get_drvdata(dev);
 
@@ -212,7 +212,7 @@ static int __maybe_unused apple_wdt_suspend(struct device *dev)
 	return 0;
 }
 
-static SIMPLE_DEV_PM_OPS(apple_wdt_pm_ops, apple_wdt_suspend, apple_wdt_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_wdt_pm_ops, apple_wdt_suspend, apple_wdt_resume);
 
 static const struct of_device_id apple_wdt_of_match[] = {
 	{ .compatible = "apple,wdt" },

@@ -252,7 +252,6 @@ static int macsmc_battery_set_charge_behaviour(struct macsmc_power *power, int v
 	default:
 		return -EINVAL;
 	}
-
 	ret = apple_smc_write_u8(power->smc, SMC_KEY(CH0I), ch0i);
 	if (ret)
 		return ret;

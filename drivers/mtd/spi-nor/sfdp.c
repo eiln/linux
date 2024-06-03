@@ -26,6 +26,11 @@
 					 * Status, Control and Configuration
 					 * Register Map.
 					 */
+#define SFDP_SCCR_MAP_MC_ID	0xff88	/*
+					 * Status, Control and Configuration
+					 * Register Map Offsets for Multi-Chip
+					 * SPI Memory Devices.
+					 */
 
 #define SFDP_SIGNATURE		0x50444653U
 
@@ -438,8 +443,10 @@ static int spi_nor_parse_bfpt(struct spi_nor *nor,
 	size_t len;
 	int i, cmd, err;
 	u32 addr, val;
+	u32 dword;
 	u16 half;
 	u8 erase_mask;
+	u8 wait_states, mode_clocks, opcode;
 
 	/* JESD216 Basic Flash Parameter Table length is at least 9 DWORDs. */
 	if (bfpt_header->length < BFPT_DWORD_MAX_JESD216)
@@ -607,6 +614,16 @@ static int spi_nor_parse_bfpt(struct spi_nor *nor,
 		break;
 	}
 
+	dword = bfpt.dwords[SFDP_DWORD(16)] & BFPT_DWORD16_4B_ADDR_MODE_MASK;
+	if (SFDP_MASK_CHECK(dword, BFPT_DWORD16_4B_ADDR_MODE_BRWR))
+		params->set_4byte_addr_mode = spi_nor_set_4byte_addr_mode_brwr;
+	else if (SFDP_MASK_CHECK(dword, BFPT_DWORD16_4B_ADDR_MODE_WREN_EN4B_EX4B))
+		params->set_4byte_addr_mode = spi_nor_set_4byte_addr_mode_wren_en4b_ex4b;
+	else if (SFDP_MASK_CHECK(dword, BFPT_DWORD16_4B_ADDR_MODE_EN4B_EX4B))
+		params->set_4byte_addr_mode = spi_nor_set_4byte_addr_mode_en4b_ex4b;
+	else
+		dev_dbg(nor->dev, "BFPT: 4-Byte Address Mode method is not recognized or not implemented\n");
+
 	/* Soft Reset support. */
 	if (bfpt.dwords[SFDP_DWORD(16)] & BFPT_DWORD16_SWRST_EN_RST)
 		nor->flags |= SNOR_F_SOFT_RESET;
@@ -614,6 +631,32 @@ static int spi_nor_parse_bfpt(struct spi_nor *nor,
 	/* Stop here if not JESD216 rev C or later. */
 	if (bfpt_header->length == BFPT_DWORD_MAX_JESD216B)
 		return spi_nor_post_bfpt_fixups(nor, bfpt_header, &bfpt);
+
+	/* Parse 1-1-8 read instruction */
+	opcode = FIELD_GET(BFPT_DWORD17_RD_1_1_8_CMD, bfpt.dwords[SFDP_DWORD(17)]);
+	if (opcode) {
+		mode_clocks = FIELD_GET(BFPT_DWORD17_RD_1_1_8_MODE_CLOCKS,
+					bfpt.dwords[SFDP_DWORD(17)]);
+		wait_states = FIELD_GET(BFPT_DWORD17_RD_1_1_8_WAIT_STATES,
+					bfpt.dwords[SFDP_DWORD(17)]);
+		params->hwcaps.mask |= SNOR_HWCAPS_READ_1_1_8;
+		spi_nor_set_read_settings(&params->reads[SNOR_CMD_READ_1_1_8],
+					  mode_clocks, wait_states, opcode,
+					  SNOR_PROTO_1_1_8);
+	}
+
+	/* Parse 1-8-8 read instruction */
+	opcode = FIELD_GET(BFPT_DWORD17_RD_1_8_8_CMD, bfpt.dwords[SFDP_DWORD(17)]);
+	if (opcode) {
+		mode_clocks = FIELD_GET(BFPT_DWORD17_RD_1_8_8_MODE_CLOCKS,
+					bfpt.dwords[SFDP_DWORD(17)]);
+		wait_states = FIELD_GET(BFPT_DWORD17_RD_1_8_8_WAIT_STATES,
+					bfpt.dwords[SFDP_DWORD(17)]);
+		params->hwcaps.mask |= SNOR_HWCAPS_READ_1_8_8;
+		spi_nor_set_read_settings(&params->reads[SNOR_CMD_READ_1_8_8],
+					  mode_clocks, wait_states, opcode,
+					  SNOR_PROTO_1_8_8);
+	}
 
 	/* 8D-8D-8D command extension. */
 	switch (bfpt.dwords[SFDP_DWORD(18)] & BFPT_DWORD18_CMD_EXT_MASK) {
@@ -952,6 +995,8 @@ static int spi_nor_parse_4bait(struct spi_nor *nor,
 		{ SNOR_HWCAPS_READ_1_1_1_DTR,	BIT(13) },
 		{ SNOR_HWCAPS_READ_1_2_2_DTR,	BIT(14) },
 		{ SNOR_HWCAPS_READ_1_4_4_DTR,	BIT(15) },
+		{ SNOR_HWCAPS_READ_1_1_8,	BIT(20) },
+		{ SNOR_HWCAPS_READ_1_8_8,	BIT(21) },
 	};
 	static const struct sfdp_4bait programs[] = {
 		{ SNOR_HWCAPS_PP,		BIT(6) },
@@ -1215,6 +1260,7 @@ out:
 static int spi_nor_parse_sccr(struct spi_nor *nor,
 			      const struct sfdp_parameter_header *sccr_header)
 {
+	struct spi_nor_flash_parameter *params = nor->params;
 	u32 *dwords, addr;
 	size_t len;
 	int ret;
@@ -1231,9 +1277,78 @@ static int spi_nor_parse_sccr(struct spi_nor *nor,
 
 	le32_to_cpu_array(dwords, sccr_header->length);
 
+	/* Address offset for volatile registers (die 0) */
+	if (!params->vreg_offset) {
+		params->vreg_offset = devm_kmalloc(nor->dev, sizeof(*dwords),
+						   GFP_KERNEL);
+		if (!params->vreg_offset) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	params->vreg_offset[0] = dwords[SFDP_DWORD(1)];
+	params->n_dice = 1;
+
 	if (FIELD_GET(SCCR_DWORD22_OCTAL_DTR_EN_VOLATILE,
 		      dwords[SFDP_DWORD(22)]))
 		nor->flags |= SNOR_F_IO_MODE_EN_VOLATILE;
+
+out:
+	kfree(dwords);
+	return ret;
+}
+
+/**
+ * spi_nor_parse_sccr_mc() - Parse the Status, Control and Configuration
+ *                           Register Map Offsets for Multi-Chip SPI Memory
+ *                           Devices.
+ * @nor:		pointer to a 'struct spi_nor'
+ * @sccr_mc_header:	pointer to the 'struct sfdp_parameter_header' describing
+ *			the SCCR Map offsets table length and version.
+ *
+ * Return: 0 on success, -errno otherwise.
+ */
+static int spi_nor_parse_sccr_mc(struct spi_nor *nor,
+				 const struct sfdp_parameter_header *sccr_mc_header)
+{
+	struct spi_nor_flash_parameter *params = nor->params;
+	u32 *dwords, addr;
+	u8 i, n_dice;
+	size_t len;
+	int ret;
+
+	len = sccr_mc_header->length * sizeof(*dwords);
+	dwords = kmalloc(len, GFP_KERNEL);
+	if (!dwords)
+		return -ENOMEM;
+
+	addr = SFDP_PARAM_HEADER_PTP(sccr_mc_header);
+	ret = spi_nor_read_sfdp(nor, addr, len, dwords);
+	if (ret)
+		goto out;
+
+	le32_to_cpu_array(dwords, sccr_mc_header->length);
+
+	/*
+	 * Pair of DOWRDs (volatile and non-volatile register offsets) per
+	 * additional die. Hence, length = 2 * (number of additional dice).
+	 */
+	n_dice = 1 + sccr_mc_header->length / 2;
+
+	/* Address offset for volatile registers of additional dice */
+	params->vreg_offset =
+			devm_krealloc(nor->dev, params->vreg_offset,
+				      n_dice * sizeof(*dwords),
+				      GFP_KERNEL);
+	if (!params->vreg_offset) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 1; i < n_dice; i++)
+		params->vreg_offset[i] = dwords[SFDP_DWORD(i) * 2];
+
+	params->n_dice = n_dice;
 
 out:
 	kfree(dwords);
@@ -1249,14 +1364,21 @@ out:
  * Used to tweak various flash parameters when information provided by the SFDP
  * tables are wrong.
  */
-static void spi_nor_post_sfdp_fixups(struct spi_nor *nor)
+static int spi_nor_post_sfdp_fixups(struct spi_nor *nor)
 {
+	int ret;
+
 	if (nor->manufacturer && nor->manufacturer->fixups &&
-	    nor->manufacturer->fixups->post_sfdp)
-		nor->manufacturer->fixups->post_sfdp(nor);
+	    nor->manufacturer->fixups->post_sfdp) {
+		ret = nor->manufacturer->fixups->post_sfdp(nor);
+		if (ret)
+			return ret;
+	}
 
 	if (nor->info->fixups && nor->info->fixups->post_sfdp)
-		nor->info->fixups->post_sfdp(nor);
+		return nor->info->fixups->post_sfdp(nor);
+
+	return 0;
 }
 
 /**
@@ -1449,6 +1571,10 @@ int spi_nor_parse_sfdp(struct spi_nor *nor)
 			err = spi_nor_parse_sccr(nor, param_header);
 			break;
 
+		case SFDP_SCCR_MAP_MC_ID:
+			err = spi_nor_parse_sccr_mc(nor, param_header);
+			break;
+
 		default:
 			break;
 		}
@@ -1466,7 +1592,7 @@ int spi_nor_parse_sfdp(struct spi_nor *nor)
 		}
 	}
 
-	spi_nor_post_sfdp_fixups(nor);
+	err = spi_nor_post_sfdp_fixups(nor);
 exit:
 	kfree(param_headers);
 	return err;

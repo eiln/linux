@@ -46,15 +46,21 @@ EXPORT_SYMBOL_GPL(usb_phy_generic_unregister);
 static int nop_set_suspend(struct usb_phy *x, int suspend)
 {
 	struct usb_phy_generic *nop = dev_get_drvdata(x->dev);
+	int ret = 0;
 
-	if (!IS_ERR(nop->clk)) {
-		if (suspend)
+	if (suspend) {
+		if (!IS_ERR(nop->clk))
 			clk_disable_unprepare(nop->clk);
-		else
+		if (!IS_ERR(nop->vcc) && !device_may_wakeup(x->dev))
+			ret = regulator_disable(nop->vcc);
+	} else {
+		if (!IS_ERR(nop->vcc) && !device_may_wakeup(x->dev))
+			ret = regulator_enable(nop->vcc);
+		if (!IS_ERR(nop->clk))
 			clk_prepare_enable(nop->clk);
 	}
 
-	return 0;
+	return ret;
 }
 
 static void nop_reset(struct usb_phy_generic *nop)
@@ -330,13 +336,11 @@ static int usb_phy_generic_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int usb_phy_generic_remove(struct platform_device *pdev)
+static void usb_phy_generic_remove(struct platform_device *pdev)
 {
 	struct usb_phy_generic *nop = platform_get_drvdata(pdev);
 
 	usb_remove_phy(&nop->phy);
-
-	return 0;
 }
 
 static const struct of_device_id nop_xceiv_dt_ids[] = {
@@ -348,7 +352,7 @@ MODULE_DEVICE_TABLE(of, nop_xceiv_dt_ids);
 
 static struct platform_driver usb_phy_generic_driver = {
 	.probe		= usb_phy_generic_probe,
-	.remove		= usb_phy_generic_remove,
+	.remove_new	= usb_phy_generic_remove,
 	.driver		= {
 		.name	= "usb_phy_generic",
 		.of_match_table = nop_xceiv_dt_ids,

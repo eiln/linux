@@ -466,12 +466,14 @@ int goya_set_fixed_properties(struct hl_device *hdev)
 	prop->pcie_dbi_base_address = mmPCIE_DBI_BASE;
 	prop->pcie_aux_dbi_reg_addr = CFG_BASE + mmPCIE_AUX_DBI;
 
-	strncpy(prop->cpucp_info.card_name, GOYA_DEFAULT_CARD_NAME,
+	strscpy_pad(prop->cpucp_info.card_name, GOYA_DEFAULT_CARD_NAME,
 		CARD_NAME_MAX_LEN);
 
 	prop->max_pending_cs = GOYA_MAX_PENDING_CS;
 
 	prop->first_available_user_interrupt = USHRT_MAX;
+	prop->tpc_interrupt_id = USHRT_MAX;
+	prop->eq_interrupt_id = GOYA_EVENT_QUEUE_MSIX_IDX;
 
 	for (i = 0 ; i < HL_MAX_DCORES ; i++)
 		prop->first_available_cq[i] = USHRT_MAX;
@@ -668,13 +670,18 @@ pci_init:
 	rc = hl_fw_read_preboot_status(hdev);
 	if (rc) {
 		if (hdev->reset_on_preboot_fail)
+			/* we are already on failure flow, so don't check if hw_fini fails. */
 			hdev->asic_funcs->hw_fini(hdev, true, false);
 		goto pci_fini;
 	}
 
 	if (goya_get_hw_state(hdev) == HL_DEVICE_HW_STATE_DIRTY) {
 		dev_dbg(hdev->dev, "H/W state is dirty, must reset before initializing\n");
-		hdev->asic_funcs->hw_fini(hdev, true, false);
+		rc = hdev->asic_funcs->hw_fini(hdev, true, false);
+		if (rc) {
+			dev_err(hdev->dev, "failed to reset HW in dirty state (%d)\n", rc);
+			goto pci_fini;
+		}
 	}
 
 	if (!hdev->pldm) {
@@ -2664,9 +2671,6 @@ int goya_mmu_init(struct hl_device *hdev)
 	u64 hop0_addr;
 	int rc, i;
 
-	if (!hdev->mmu_enable)
-		return 0;
-
 	if (goya->hw_cap_initialized & HW_CAP_MMU)
 		return 0;
 
@@ -2782,7 +2786,7 @@ disable_queues:
 	return rc;
 }
 
-static void goya_hw_fini(struct hl_device *hdev, bool hard_reset, bool fw_reset)
+static int goya_hw_fini(struct hl_device *hdev, bool hard_reset, bool fw_reset)
 {
 	struct goya_device *goya = hdev->asic_specific;
 	u32 reset_timeout_ms, cpu_timeout_ms, status;
@@ -2828,17 +2832,17 @@ static void goya_hw_fini(struct hl_device *hdev, bool hard_reset, bool fw_reset)
 	msleep(reset_timeout_ms);
 
 	status = RREG32(mmPSOC_GLOBAL_CONF_BTM_FSM);
-	if (status & PSOC_GLOBAL_CONF_BTM_FSM_STATE_MASK)
-		dev_err(hdev->dev,
-			"Timeout while waiting for device to reset 0x%x\n",
-			status);
+	if (status & PSOC_GLOBAL_CONF_BTM_FSM_STATE_MASK) {
+		dev_err(hdev->dev, "Timeout while waiting for device to reset 0x%x\n", status);
+		return -ETIMEDOUT;
+	}
 
 	if (!hard_reset && goya) {
 		goya->hw_cap_initialized &= ~(HW_CAP_DMA | HW_CAP_MME |
 						HW_CAP_GOLDEN | HW_CAP_TPC);
 		WREG32(mmGIC_DISTRIBUTOR__5_GICD_SETSPI_NSR,
 				GOYA_ASYNC_EVENT_ID_SOFT_RESET);
-		return;
+		return 0;
 	}
 
 	/* Chicken bit to re-initiate boot sequencer flow */
@@ -2857,6 +2861,7 @@ static void goya_hw_fini(struct hl_device *hdev, bool hard_reset, bool fw_reset)
 
 		memset(goya->events_stat, 0, sizeof(goya->events_stat));
 	}
+	return 0;
 }
 
 int goya_suspend(struct hl_device *hdev)
@@ -3353,7 +3358,7 @@ static int goya_pin_memory_before_cs(struct hl_device *hdev,
 
 	list_add_tail(&userptr->job_node, parser->job_userptr_list);
 
-	rc = hdev->asic_funcs->asic_dma_map_sgtable(hdev, userptr->sgt, dir);
+	rc = hl_dma_map_sgtable(hdev, userptr->sgt, dir);
 	if (rc) {
 		dev_err(hdev->dev, "failed to map sgt with DMA region\n");
 		goto unpin_memory;
@@ -5117,7 +5122,7 @@ int goya_cpucp_info_get(struct hl_device *hdev)
 	}
 
 	if (!strlen(prop->cpucp_info.card_name))
-		strncpy(prop->cpucp_info.card_name, GOYA_DEFAULT_CARD_NAME,
+		strscpy_pad(prop->cpucp_info.card_name, GOYA_DEFAULT_CARD_NAME,
 				CARD_NAME_MAX_LEN);
 
 	return 0;
@@ -5460,9 +5465,9 @@ static const struct hl_asic_funcs goya_funcs = {
 	.asic_dma_pool_free = goya_dma_pool_free,
 	.cpu_accessible_dma_pool_alloc = goya_cpu_accessible_dma_pool_alloc,
 	.cpu_accessible_dma_pool_free = goya_cpu_accessible_dma_pool_free,
-	.hl_dma_unmap_sgtable = hl_dma_unmap_sgtable,
+	.dma_unmap_sgtable = hl_asic_dma_unmap_sgtable,
 	.cs_parser = goya_cs_parser,
-	.asic_dma_map_sgtable = hl_dma_map_sgtable,
+	.dma_map_sgtable = hl_asic_dma_map_sgtable,
 	.add_end_of_cb_packets = goya_add_end_of_cb_packets,
 	.update_eq_ci = goya_update_eq_ci,
 	.context_switch = goya_context_switch,

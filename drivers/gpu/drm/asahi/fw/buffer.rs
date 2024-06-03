@@ -151,7 +151,6 @@ pub(crate) struct Scene {
     pub(crate) tpc: Arc<GpuArray<u8>>,
     pub(crate) clustering: Option<ClusterBuffers>,
     pub(crate) preempt_buf: GpuArray<u8>,
-    pub(crate) seq_buf: GpuArray<u64>,
     #[ver(G >= G14X)]
     pub(crate) control_word: GpuArray<u32>,
 }

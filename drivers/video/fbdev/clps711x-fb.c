@@ -155,13 +155,11 @@ static int clps711x_fb_blank(int blank, struct fb_info *info)
 
 static const struct fb_ops clps711x_fb_ops = {
 	.owner		= THIS_MODULE,
+	FB_DEFAULT_IOMEM_OPS,
 	.fb_setcolreg	= clps711x_fb_setcolreg,
 	.fb_check_var	= clps711x_fb_check_var,
 	.fb_set_par	= clps711x_fb_set_par,
 	.fb_blank	= clps711x_fb_blank,
-	.fb_fillrect	= sys_fillrect,
-	.fb_copyarea	= sys_copyarea,
-	.fb_imageblit	= sys_imageblit,
 };
 
 static int clps711x_lcd_check_fb(struct lcd_device *lcddev, struct fb_info *fi)
@@ -310,7 +308,6 @@ static int clps711x_fb_probe(struct platform_device *pdev)
 	}
 
 	info->fbops = &clps711x_fb_ops;
-	info->flags = FBINFO_DEFAULT;
 	info->var.activate = FB_ACTIVATE_FORCE | FB_ACTIVATE_NOW;
 	info->var.height = -1;
 	info->var.width = -1;
@@ -350,7 +347,7 @@ out_fb_release:
 	return ret;
 }
 
-static int clps711x_fb_remove(struct platform_device *pdev)
+static void clps711x_fb_remove(struct platform_device *pdev)
 {
 	struct fb_info *info = platform_get_drvdata(pdev);
 	struct clps711x_fb_info *cfb = info->par;
@@ -360,8 +357,6 @@ static int clps711x_fb_remove(struct platform_device *pdev)
 	unregister_framebuffer(info);
 	fb_dealloc_cmap(&info->cmap);
 	framebuffer_release(info);
-
-	return 0;
 }
 
 static const struct of_device_id clps711x_fb_dt_ids[] = {
@@ -376,7 +371,7 @@ static struct platform_driver clps711x_fb_driver = {
 		.of_match_table	= clps711x_fb_dt_ids,
 	},
 	.probe	= clps711x_fb_probe,
-	.remove	= clps711x_fb_remove,
+	.remove_new = clps711x_fb_remove,
 };
 module_platform_driver(clps711x_fb_driver);
 

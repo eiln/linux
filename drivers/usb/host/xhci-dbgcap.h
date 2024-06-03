@@ -82,6 +82,7 @@ enum dbc_state {
 	DS_CONNECTED,
 	DS_CONFIGURED,
 	DS_STALLED,
+	DS_MAX
 };
 
 struct dbc_ep {
@@ -132,6 +133,10 @@ struct xhci_dbc {
 	struct dbc_str_descs		*string;
 	dma_addr_t			string_dma;
 	size_t				string_size;
+	u16				idVendor;
+	u16				idProduct;
+	u16				bcdDevice;
+	u8				bInterfaceProtocol;
 
 	enum dbc_state			state;
 	struct delayed_work		event_work;

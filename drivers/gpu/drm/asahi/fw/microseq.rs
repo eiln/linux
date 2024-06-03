@@ -224,7 +224,7 @@ pub(crate) struct FinalizeVertex {
     pub(crate) unk_68_g14: U64,
 
     pub(crate) restart_branch_offset: i32,
-    pub(crate) has_attachments: u32,
+    pub(crate) has_attachments: u32, // Check DCMP errors bits 2,3 1=ktrace 2=log 3=panic
 
     #[ver(V >= V13_0B4)]
     pub(crate) unk_74: Array<0x10, u8>,
@@ -243,7 +243,7 @@ pub(crate) struct StartFragment<'a> {
     #[ver(G >= G14X)]
     pub(crate) registers: GpuWeakPointer<job::raw::RegisterArray>,
     pub(crate) scene: GpuPointer<'a, buffer::Scene::ver>,
-    pub(crate) stats: GpuWeakPointer<initdata::raw::GpuStatsFrag>,
+    pub(crate) stats: GpuWeakPointer<initdata::raw::GpuStatsFrag::ver>,
     pub(crate) busy_flag: GpuWeakPointer<u32>,
     pub(crate) tvb_overflow_count: GpuWeakPointer<u32>,
     pub(crate) unk_pointer: GpuWeakPointer<u32>,
@@ -253,7 +253,7 @@ pub(crate) struct StartFragment<'a> {
     pub(crate) unk_50: u32,
     pub(crate) event_generation: u32,
     pub(crate) buffer_slot: u32,
-    pub(crate) large_tib: u32,
+    pub(crate) sync_grow: u32,
     pub(crate) event_seq: U64,
     pub(crate) unk_68: u32,
     pub(crate) unk_758_flag: GpuWeakPointer<u32>,
@@ -290,7 +290,7 @@ pub(crate) struct FinalizeFragment {
     pub(crate) scene: GpuWeakPointer<buffer::Scene::ver>,
     pub(crate) buffer: GpuWeakPointer<buffer::Info::ver>,
     pub(crate) unk_2c: U64,
-    pub(crate) stats: GpuWeakPointer<initdata::raw::GpuStatsFrag>,
+    pub(crate) stats: GpuWeakPointer<initdata::raw::GpuStatsFrag::ver>,
     pub(crate) unk_pointer: GpuWeakPointer<u32>,
     pub(crate) busy_flag: GpuWeakPointer<u32>,
     pub(crate) work_queue: GpuWeakPointer<workqueue::QueueInfo::ver>,
@@ -310,7 +310,7 @@ pub(crate) struct FinalizeFragment {
     pub(crate) unk_8c_g14: U64,
 
     pub(crate) restart_branch_offset: i32,
-    pub(crate) has_attachments: u32,
+    pub(crate) has_attachments: u32, // Check DCMP errors bits 2,3 1=ktrace 2=log 3=panic
 
     #[ver(V >= V13_0B4)]
     pub(crate) unk_9c: Array<0x10, u8>,
@@ -324,8 +324,10 @@ impl Operation for FinalizeFragment::ver {}
 #[repr(C)]
 pub(crate) struct StartCompute<'a> {
     pub(crate) header: op::StartCompute,
-    pub(crate) unk_pointer: GpuWeakPointer<Array<0x54, u8>>,
-    pub(crate) job_params1: GpuWeakPointer<compute::raw::JobParameters1<'a>>,
+    pub(crate) unk_pointer: GpuWeakPointer<u32>,
+    pub(crate) job_params1: Option<GpuWeakPointer<compute::raw::JobParameters1<'a>>>,
+    #[ver(G >= G14X)]
+    pub(crate) registers: GpuWeakPointer<job::raw::RegisterArray>,
     pub(crate) stats: GpuWeakPointer<initdata::GpuStatsComp>,
     pub(crate) work_queue: GpuWeakPointer<workqueue::QueueInfo::ver>,
     pub(crate) vm_slot: u32,
@@ -381,7 +383,7 @@ pub(crate) struct FinalizeCompute<'a> {
     pub(crate) unk_5c_g14: U64,
 
     pub(crate) restart_branch_offset: i32,
-    pub(crate) has_attachments: u32,
+    pub(crate) has_attachments: u32, // Check DCMP errors bits 2,3 1=ktrace 2=log 3=panic
 
     #[ver(V >= V13_0B4)]
     pub(crate) unk_64: Array<0xd, u8>,

@@ -71,9 +71,7 @@ pub(crate) enum GpuCore {
     G14G = 15,
     G14S = 16,
     G14C = 17,
-    // G15M = 18,
-    // G15P_AGX2 = 19,
-    // G15P = 20,
+    G14D = 18, // Split out, unlike G13D
 }
 
 /// GPU revision ID. Note: Part of the firmware ABI.
@@ -135,10 +133,14 @@ pub(crate) struct PowerZone {
 pub(crate) struct IOMapping {
     /// Base physical address of the mapping.
     pub(crate) base: usize,
-    /// Size of the mapping.
+    /// Whether this mapping should be replicated to all dies
+    pub(crate) per_die: bool,
+    /// Number of mappings.
+    pub(crate) count: usize,
+    /// Size of one mapping.
     pub(crate) size: usize,
-    /// Range size of the mapping (for arrays?)
-    pub(crate) range_size: usize,
+    /// Stride between mappings.
+    pub(crate) stride: usize,
     /// Whether the mapping should be writable.
     pub(crate) writable: bool,
 }
@@ -147,14 +149,18 @@ impl IOMapping {
     /// Convenience constructor for a new IOMapping.
     pub(crate) const fn new(
         base: usize,
+        per_die: bool,
+        count: usize,
         size: usize,
-        range_size: usize,
+        stride: usize,
         writable: bool,
     ) -> IOMapping {
         IOMapping {
             base,
+            per_die,
+            count,
             size,
-            range_size,
+            stride,
             writable,
         }
     }
@@ -173,6 +179,7 @@ pub(crate) struct HwConfigA {
 #[allow(missing_docs)]
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct HwConfigB {
+    pub(crate) unk_454: u32,
     pub(crate) unk_4e0: u64,
     pub(crate) unk_534: u32,
     pub(crate) unk_ab8: u32,
@@ -243,6 +250,9 @@ pub(crate) struct HwConfig {
     /// Required size of the third preemption buffer.
     pub(crate) preempt3_size: usize,
 
+    /// Required size of the compute preemption buffer.
+    pub(crate) compute_preempt1_size: usize,
+
     pub(crate) clustering: Option<HwClusteringConfig>,
 
     /// Rendering-relevant configuration.
@@ -268,8 +278,8 @@ pub(crate) struct HwConfig {
     /// HwDataShared3.table.
     pub(crate) shared3_tab: &'static [u32],
 
-    /// Globals.unk_hws2_0.
-    pub(crate) unk_hws2_0: u32,
+    /// Globals.idle_off_standby_timer.
+    pub(crate) idle_off_standby_timer_default: u32,
     /// Globals.unk_hws2_4.
     pub(crate) unk_hws2_4: Option<[F32; 8]>,
     /// Globals.unk_hws2_24.
@@ -311,6 +321,8 @@ pub(crate) struct DynConfig {
     pub(crate) id: GpuIdConfig,
     /// Power calibration configuration for this specific chip/device.
     pub(crate) pwr: PwrConfig,
+    /// Firmware version.
+    pub(crate) firmware_version: Vec<u32>,
 }
 
 /// Specific GPU ID configuration fetched from SGX MMIO registers.
@@ -324,8 +336,6 @@ pub(crate) struct GpuIdConfig {
     pub(crate) gpu_rev: GpuRevision,
     /// GPU silicon revision ID (firmware enum).
     pub(crate) gpu_rev_id: GpuRevisionID,
-    /// Maximum number of dies supported.
-    pub(crate) max_dies: u32,
     /// Total number of GPU clusters.
     pub(crate) num_clusters: u32,
     /// Maximum number of GPU cores per cluster.
@@ -410,6 +420,8 @@ pub(crate) struct PwrConfig {
     pub(crate) fw_early_wake_timeout_ms: u32,
     /// Delay from the GPU becoming idle to powerdown
     pub(crate) idle_off_delay_ms: u32,
+    /// Related to the above?
+    pub(crate) idle_off_standby_timer: u32,
     /// Percent?
     pub(crate) perf_boost_ce_step: u32,
     /// Minimum utilization before performance state is increased in %.
@@ -604,6 +616,10 @@ impl PwrConfig {
             fender_idle_off_delay_ms: prop!("apple,fender-idle-off-delay-ms", 40),
             fw_early_wake_timeout_ms: prop!("apple,fw-early-wake-timeout-ms", 5),
             idle_off_delay_ms: prop!("apple,idle-off-delay-ms", 2),
+            idle_off_standby_timer: prop!(
+                "apple,idleoff-standby-timer",
+                cfg.idle_off_standby_timer_default
+            ),
             perf_boost_ce_step: prop!("apple,perf-boost-ce-step", 25),
             perf_boost_min_util: prop!("apple,perf-boost-min-util", 100),
             perf_filter_drop_threshold: prop!("apple,perf-filter-drop-threshold"),

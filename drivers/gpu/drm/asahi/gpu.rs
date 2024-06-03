@@ -18,6 +18,7 @@ use core::time::Duration;
 use kernel::{
     c_str,
     delay::coarse_sleep,
+    device::RawDevice,
     error::code::*,
     macros::versions,
     prelude::*,
@@ -26,7 +27,7 @@ use kernel::{
         lock::{mutex::MutexBackend, Guard},
         Arc, Mutex, UniqueArc,
     },
-    time,
+    time::{clock, Now},
     types::ForeignOwnable,
 };
 
@@ -87,14 +88,22 @@ const IOVA_KERN_SHARED_RO_TOP: u64 = 0xffffffabffffffff;
 const IOVA_KERN_GPU_BASE: u64 = 0xffffffac00000000;
 /// GPU/FW shared structure VA range top.
 const IOVA_KERN_GPU_TOP: u64 = 0xffffffadffffffff;
+/// GPU/FW shared structure VA range base.
+const IOVA_KERN_RTKIT_BASE: u64 = 0xffffffae00000000;
+/// GPU/FW shared structure VA range top.
+const IOVA_KERN_RTKIT_TOP: u64 = 0xffffffae0fffffff;
+/// FW MMIO VA range base.
+const IOVA_KERN_MMIO_BASE: u64 = 0xffffffaf00000000;
+/// FW MMIO VA range top.
+const IOVA_KERN_MMIO_TOP: u64 = 0xffffffafffffffff;
 
-/// GPU/FW low shared structure VA range base.
-const IOVA_KERN_GPU_LOW_BASE: u64 = 0x20_0000_0000;
-/// GPU/FW low shared structure VA range top.
-const IOVA_KERN_GPU_LOW_TOP: u64 = 0x20_ffff_ffff;
+/// GPU/FW buffer manager control address (context 0 low)
+pub(crate) const IOVA_KERN_GPU_BUFMGR_LOW: u64 = 0x20_0000_0000;
+/// GPU/FW buffer manager control address (context 0 high)
+pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffffffaeffff0000;
 
 /// Timeout for entering the halt state after a fault or request.
-const HALT_ENTER_TIMEOUT_MS: u64 = 100;
+const HALT_ENTER_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Maximum amount of firmware-private memory garbage allowed before collection.
 /// Collection flushes the FW cache and is expensive, so this needs to be
@@ -109,14 +118,13 @@ pub(crate) struct KernelAllocators {
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
     pub(crate) gpu_ro: alloc::DefaultAllocator,
-    pub(crate) gpu_low: alloc::DefaultAllocator,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
 #[versions(AGX)]
 #[pin_data]
 struct RxChannels {
-    event: channel::EventChannel,
+    event: channel::EventChannel::ver,
     fw_log: channel::FwLogChannel,
     ktrace: channel::KTraceChannel,
     stats: channel::StatsChannel::ver,
@@ -199,6 +207,7 @@ pub(crate) struct GpuManager {
     #[pin]
     alloc: Mutex<KernelAllocators>,
     io_mappings: Vec<mmu::Mapping>,
+    next_mmio_iova: u64,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<GpuManager::ver>>>,
     #[pin]
@@ -209,7 +218,7 @@ pub(crate) struct GpuManager {
     fwctl_channel: Mutex<channel::FwCtlChannel>,
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
-    buffer_mgr: buffer::BufferManager,
+    buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[pin]
     garbage_work: Mutex<Vec<Box<dyn workqueue::GenSubmittedWork>>>,
@@ -257,9 +266,11 @@ pub(crate) trait GpuManager: Send + Sync {
     /// TODO: Does this actually work?
     fn flush_fw_cache(&self) -> Result;
     /// Handle a GPU work timeout event.
-    fn handle_timeout(&self, counter: u32, event_slot: u32);
+    fn handle_timeout(&self, counter: u32, event_slot: i32);
     /// Handle a GPU fault event.
     fn handle_fault(&self);
+    /// Acknowledge a Buffer grow op.
+    fn ack_grow(&self, buffer_slot: u32, vm_slot: u32, counter: u32);
     /// Wait for the GPU to become idle and power off.
     fn wait_for_poweroff(&self, timeout: usize) -> Result;
     /// Send a firmware control command (secure cache flush).
@@ -327,7 +338,14 @@ impl rtkit::Operations for GpuManager::ver {
 
         let mut obj = gem::new_kernel_object(dev, size)?;
         obj.vmap()?;
-        let iova = obj.map_into(data.uat.kernel_vm())?;
+        let iova = obj.map_into_range(
+            data.uat.kernel_vm(),
+            IOVA_KERN_RTKIT_BASE,
+            IOVA_KERN_RTKIT_TOP,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_FW_SHARED_RW,
+            true,
+        )?;
         mod_dev_dbg!(dev, "shmem_alloc() -> VA {:#x}\n", iova);
         Ok(obj)
     }
@@ -406,22 +424,24 @@ impl GpuManager::ver {
                 fmt!("Kernel GPU RO Shared"),
                 true,
             )?,
-            gpu_low: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_lower_vm(),
-                IOVA_KERN_GPU_LOW_BASE,
-                IOVA_KERN_GPU_LOW_TOP,
-                0x80,
-                mmu::PROT_GPU_FW_SHARED_RW,
-                64 * 1024,
-                true,
-                fmt!("Kernel GPU Lower"),
-                false,
-            )?,
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;
-        let initdata = Self::make_initdata(cfg, &dyncfg, &mut alloc)?;
+        let mut initdata = Self::make_initdata(dev, cfg, &dyncfg, &mut alloc)?;
+
+        initdata.runtime_pointers.buffer_mgr_ctl.map_at(
+            uat.kernel_lower_vm(),
+            IOVA_KERN_GPU_BUFMGR_LOW,
+            mmu::PROT_GPU_SHARED_RW,
+            false,
+        )?;
+        initdata.runtime_pointers.buffer_mgr_ctl.map_at(
+            uat.kernel_vm(),
+            IOVA_KERN_GPU_BUFMGR_HIGH,
+            mmu::PROT_FW_SHARED_RW,
+            false,
+        )?;
+
         let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata)?;
 
         {
@@ -492,18 +512,19 @@ impl GpuManager::ver {
 
         for (i, map) in cfg.io_mappings.iter().enumerate() {
             if let Some(map) = map.as_ref() {
-                Self::iomap(&mut mgr, i, map)?;
+                Self::iomap(&mut mgr, cfg, i, map)?;
             }
         }
 
         #[ver(V >= V13_0B4)]
         if let Some(base) = cfg.sram_base {
             let size = cfg.sram_size.unwrap() as usize;
+            let iova = mgr.as_mut().alloc_mmio_iova(size);
 
             let mapping =
                 mgr.uat
                     .kernel_vm()
-                    .map_io(base as usize, size, mmu::PROT_FW_SHARED_RW)?;
+                    .map_io(iova, base as usize, size, mmu::PROT_FW_SHARED_RW)?;
 
             mgr.as_mut()
                 .initdata_mut()
@@ -544,13 +565,29 @@ impl GpuManager::ver {
         unsafe { &mut self.get_unchecked_mut().io_mappings }
     }
 
+    /// Allocate an MMIO iova range
+    fn alloc_mmio_iova(self: Pin<&mut Self>, size: usize) -> u64 {
+        // SAFETY: next_mmio_iova does not require structural pinning.
+        let next_ref = unsafe { &mut self.get_unchecked_mut().next_mmio_iova };
+
+        let addr = *next_ref;
+        let next = addr + (size + mmu::UAT_PGSZ) as u64;
+
+        assert!(next - 1 <= IOVA_KERN_MMIO_TOP);
+
+        *next_ref = next;
+
+        addr
+    }
+
     /// Build the entire GPU InitData structure tree and return it as a boxed GpuObject.
     fn make_initdata(
+        dev: &AsahiDevice,
         cfg: &'static hw::HwConfig,
         dyncfg: &hw::DynConfig,
         alloc: &mut KernelAllocators,
     ) -> Result<Box<fw::types::GpuObject<fw::initdata::InitData::ver>>> {
-        let mut builder = initdata::InitDataBuilder::ver::new(alloc, cfg, dyncfg);
+        let mut builder = initdata::InitDataBuilder::ver::new(dev, alloc, cfg, dyncfg);
         builder.build()
     }
 
@@ -605,10 +642,17 @@ impl GpuManager::ver {
 
         let fwctl_channel = channel::FwCtlChannel::new(dev, &mut alloc)?;
 
+        let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
+        let buffer_mgr_clone = buffer_mgr.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = Box::init(try_init!(RxChannels::ver {
-            event: channel::EventChannel::new(dev, alloc_ref, event_manager_clone)?,
+            event: channel::EventChannel::ver::new(
+                dev,
+                alloc_ref,
+                event_manager_clone,
+                buffer_mgr_clone,
+            )?,
             fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
             ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
             stats: channel::StatsChannel::ver::new(dev, alloc_ref)?,
@@ -626,6 +670,7 @@ impl GpuManager::ver {
             initdata: *initdata,
             uat: *uat,
             io_mappings: Vec::new(),
+            next_mmio_iova: IOVA_KERN_MMIO_BASE,
             rtkit <- Mutex::new_named(None, c_str!("rtkit")),
             crashed: AtomicBool::new(false),
             event_manager,
@@ -634,7 +679,7 @@ impl GpuManager::ver {
             rx_channels <- Mutex::new_named(*rx_channels, c_str!("rx_channels")),
             tx_channels <- Mutex::new_named(*tx_channels, c_str!("tx_channels")),
             pipes,
-            buffer_mgr: buffer::BufferManager::new()?,
+            buffer_mgr,
             ids: Default::default(),
             garbage_work <- Mutex::new_named(Vec::new(), c_str!("garbage_work")),
             garbage_contexts <- Mutex::new_named(Vec::new(), c_str!("garbage_contexts")),
@@ -662,7 +707,6 @@ impl GpuManager::ver {
             gpu_id.gpu_gen,
             gpu_id.gpu_variant
         );
-        dev_info!(dev, "  Max dies: {}\n", gpu_id.max_dies);
         dev_info!(dev, "  Clusters: {}\n", gpu_id.num_clusters);
         dev_info!(
             dev,
@@ -737,10 +781,13 @@ impl GpuManager::ver {
             return Err(EIO);
         }
 
+        let node = dev.of_node().ok_or(EIO)?;
+
         Ok(Box::try_new(hw::DynConfig {
             pwr: pwr_cfg,
             uat_ttb_base: uat.ttb_base(),
             id: gpu_id,
+            firmware_version: node.get_property(c_str!("apple,firmware-version"))?,
         })?)
     }
 
@@ -753,21 +800,47 @@ impl GpuManager::ver {
     /// index.
     fn iomap(
         this: &mut Pin<UniqueArc<GpuManager::ver>>,
+        cfg: &'static hw::HwConfig,
         index: usize,
         map: &hw::IOMapping,
     ) -> Result {
+        let dies = if map.per_die {
+            cfg.num_dies as usize
+        } else {
+            1
+        };
+
         let off = map.base & mmu::UAT_PGMSK;
         let base = map.base - off;
         let end = (map.base + map.size + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK;
-        let mapping = this.uat.kernel_vm().map_io(
-            base,
-            end - base,
-            if map.writable {
-                mmu::PROT_FW_MMIO_RW
-            } else {
-                mmu::PROT_FW_MMIO_RO
-            },
-        )?;
+        let map_size = end - base;
+
+        // Array mappings must be aligned
+        assert!((off == 0 && map_size == map.size) || (map.count == 1 && !map.per_die));
+        assert!(map.count > 0);
+
+        let iova = this.as_mut().alloc_mmio_iova(map_size * map.count * dies);
+        let mut cur_iova = iova;
+
+        for die in 0..dies {
+            for i in 0..map.count {
+                let phys_off = die * 0x20_0000_0000 + i * map.stride;
+
+                let mapping = this.uat.kernel_vm().map_io(
+                    cur_iova,
+                    base + phys_off,
+                    map_size,
+                    if map.writable {
+                        mmu::PROT_FW_MMIO_RW
+                    } else {
+                        mmu::PROT_FW_MMIO_RO
+                    },
+                )?;
+
+                this.as_mut().io_mappings_mut().try_push(mapping)?;
+                cur_iova += map_size as u64;
+            }
+        }
 
         this.as_mut()
             .initdata_mut()
@@ -776,14 +849,13 @@ impl GpuManager::ver {
             .with_mut(|raw, _| {
                 raw.io_mappings[index] = fw::initdata::raw::IOMapping {
                     phys_addr: U64(map.base as u64),
-                    virt_addr: U64((mapping.iova() + off) as u64),
-                    size: map.size as u32,
-                    range_size: map.range_size as u32,
+                    virt_addr: U64(iova + off as u64),
+                    total_size: (map.size * map.count * dies) as u32,
+                    element_size: map.size as u32,
                     readwrite: U64(map.writable as u64),
                 };
             });
 
-        this.as_mut().io_mappings_mut().try_push(mapping)?;
         Ok(())
     }
 
@@ -793,16 +865,23 @@ impl GpuManager::ver {
         dev_err!(self.dev, "  Pending events:\n");
 
         self.initdata.globals.with(|raw, _inner| {
-            for i in raw.pending_stamps.iter() {
+            for (index, i) in raw.pending_stamps.iter().enumerate() {
                 let info = i.info.load(Ordering::Relaxed);
                 let wait_value = i.wait_value.load(Ordering::Relaxed);
 
                 if info & 1 != 0 {
-                    let slot = info >> 3;
+                    #[ver(V >= V13_5)]
+                    let slot = (info >> 4) & 0x7f;
+                    #[ver(V < V13_5)]
+                    let slot = (info >> 3) & 0x7f;
+                    #[ver(V >= V13_5)]
+                    let flags = info & 0xf;
+                    #[ver(V < V13_5)]
                     let flags = info & 0x7;
                     dev_err!(
                         self.dev,
-                        "    [{}] flags={} value={:#x}\n",
+                        "    [{}:{}] flags={} value={:#x}\n",
+                        index,
                         slot,
                         flags,
                         wait_value
@@ -848,8 +927,8 @@ impl GpuManager::ver {
             dev_err!(self.dev, "  Halted: {}\n", halted);
 
             if halted == 0 {
-                let timeout = time::ktime_get() + Duration::from_millis(HALT_ENTER_TIMEOUT_MS);
-                while time::ktime_get() < timeout {
+                let start = clock::KernelTime::now();
+                while start.elapsed() < HALT_ENTER_TIMEOUT {
                     halted = raw.flags.halted.load(Ordering::Relaxed);
                     if halted != 0 {
                         break;
@@ -1178,7 +1257,7 @@ impl GpuManager for GpuManager::ver {
         &self.ids
     }
 
-    fn handle_timeout(&self, counter: u32, event_slot: u32) {
+    fn handle_timeout(&self, counter: u32, event_slot: i32) {
         dev_err!(self.dev, " (\\________/) \n");
         dev_err!(self.dev, "  |        |  \n");
         dev_err!(self.dev, "'.| \\  , / |.'\n");
@@ -1194,7 +1273,7 @@ impl GpuManager for GpuManager::ver {
             Some(info) => workqueue::WorkError::Fault(info),
             None => workqueue::WorkError::Timeout,
         };
-        self.mark_pending_events(Some(event_slot), error);
+        self.mark_pending_events(event_slot.try_into().ok(), error);
         self.recover();
     }
 
@@ -1212,6 +1291,33 @@ impl GpuManager for GpuManager::ver {
         };
         self.mark_pending_events(None, error);
         self.recover();
+    }
+
+    fn ack_grow(&self, buffer_slot: u32, vm_slot: u32, counter: u32) {
+        let dc = fw::channels::DeviceControlMsg::ver::GrowTVBAck {
+            unk_4: 1,
+            buffer_slot,
+            vm_slot,
+            counter,
+            subpipe: 0, // TODO
+            __pad: Default::default(),
+        };
+
+        mod_dev_dbg!(self.dev, "TVB Grow Ack command: {:?}\n", &dc);
+
+        let mut txch = self.tx_channels.lock();
+
+        txch.device_control.send(&dc);
+        {
+            let mut guard = self.rtkit.lock();
+            let rtk = guard.as_mut().unwrap();
+            if rtk
+                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
+                .is_err()
+            {
+                dev_err!(self.dev, "Failed to send TVB Grow Ack command\n");
+            }
+        }
     }
 
     fn wait_for_poweroff(&self, timeout: usize) -> Result {

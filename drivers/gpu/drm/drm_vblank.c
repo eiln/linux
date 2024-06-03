@@ -210,11 +210,6 @@ static u32 __get_vblank_counter(struct drm_device *dev, unsigned int pipe)
 		if (crtc->funcs->get_vblank_counter)
 			return crtc->funcs->get_vblank_counter(crtc);
 	}
-#ifdef CONFIG_DRM_LEGACY
-	else if (dev->driver->get_vblank_counter) {
-		return dev->driver->get_vblank_counter(dev, pipe);
-	}
-#endif
 
 	return drm_vblank_no_hw_counter(dev, pipe);
 }
@@ -433,11 +428,6 @@ static void __disable_vblank(struct drm_device *dev, unsigned int pipe)
 		if (crtc->funcs->disable_vblank)
 			crtc->funcs->disable_vblank(crtc);
 	}
-#ifdef CONFIG_DRM_LEGACY
-	else {
-		dev->driver->disable_vblank(dev, pipe);
-	}
-#endif
 }
 
 /*
@@ -844,10 +834,9 @@ bool drm_crtc_vblank_helper_get_vblank_timestamp(struct drm_crtc *crtc,
 EXPORT_SYMBOL(drm_crtc_vblank_helper_get_vblank_timestamp);
 
 /**
- * drm_get_last_vbltimestamp - retrieve raw timestamp for the most recent
- *                             vblank interval
- * @dev: DRM device
- * @pipe: index of CRTC whose vblank timestamp to retrieve
+ * drm_crtc_get_last_vbltimestamp - retrieve raw timestamp for the most
+ *                                  recent vblank interval
+ * @crtc: CRTC whose vblank timestamp to retrieve
  * @tvblank: Pointer to target time which should receive the timestamp
  * @in_vblank_irq:
  *     True when called from drm_crtc_handle_vblank().  Some drivers
@@ -865,10 +854,9 @@ EXPORT_SYMBOL(drm_crtc_vblank_helper_get_vblank_timestamp);
  * True if timestamp is considered to be very precise, false otherwise.
  */
 static bool
-drm_get_last_vbltimestamp(struct drm_device *dev, unsigned int pipe,
-			  ktime_t *tvblank, bool in_vblank_irq)
+drm_crtc_get_last_vbltimestamp(struct drm_crtc *crtc, ktime_t *tvblank,
+			       bool in_vblank_irq)
 {
-	struct drm_crtc *crtc = drm_crtc_from_index(dev, pipe);
 	bool ret = false;
 
 	/* Define requested maximum error on timestamps (nanoseconds). */
@@ -876,8 +864,6 @@ drm_get_last_vbltimestamp(struct drm_device *dev, unsigned int pipe,
 
 	/* Query driver if possible and precision timestamping enabled. */
 	if (crtc && crtc->funcs->get_vblank_timestamp && max_error > 0) {
-		struct drm_crtc *crtc = drm_crtc_from_index(dev, pipe);
-
 		ret = crtc->funcs->get_vblank_timestamp(crtc, &max_error,
 							tvblank, in_vblank_irq);
 	}
@@ -889,6 +875,15 @@ drm_get_last_vbltimestamp(struct drm_device *dev, unsigned int pipe,
 		*tvblank = ktime_get();
 
 	return ret;
+}
+
+static bool
+drm_get_last_vbltimestamp(struct drm_device *dev, unsigned int pipe,
+			  ktime_t *tvblank, bool in_vblank_irq)
+{
+	struct drm_crtc *crtc = drm_crtc_from_index(dev, pipe);
+
+	return drm_crtc_get_last_vbltimestamp(crtc, tvblank, in_vblank_irq);
 }
 
 /**
@@ -979,6 +974,42 @@ u64 drm_crtc_vblank_count_and_time(struct drm_crtc *crtc,
 					 vblanktime);
 }
 EXPORT_SYMBOL(drm_crtc_vblank_count_and_time);
+
+/**
+ * drm_crtc_next_vblank_start - calculate the time of the next vblank
+ * @crtc: the crtc for which to calculate next vblank time
+ * @vblanktime: pointer to time to receive the next vblank timestamp.
+ *
+ * Calculate the expected time of the start of the next vblank period,
+ * based on time of previous vblank and frame duration
+ */
+int drm_crtc_next_vblank_start(struct drm_crtc *crtc, ktime_t *vblanktime)
+{
+	unsigned int pipe = drm_crtc_index(crtc);
+	struct drm_vblank_crtc *vblank;
+	struct drm_display_mode *mode;
+	u64 vblank_start;
+
+	if (!drm_dev_has_vblank(crtc->dev))
+		return -EINVAL;
+
+	vblank = &crtc->dev->vblank[pipe];
+	mode = &vblank->hwmode;
+
+	if (!vblank->framedur_ns || !vblank->linedur_ns)
+		return -EINVAL;
+
+	if (!drm_crtc_get_last_vbltimestamp(crtc, vblanktime, false))
+		return -EINVAL;
+
+	vblank_start = DIV_ROUND_DOWN_ULL(
+			(u64)vblank->framedur_ns * mode->crtc_vblank_start,
+			mode->crtc_vtotal);
+	*vblanktime  = ktime_add(*vblanktime, ns_to_ktime(vblank_start));
+
+	return 0;
+}
+EXPORT_SYMBOL(drm_crtc_next_vblank_start);
 
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
@@ -1110,11 +1141,6 @@ static int __enable_vblank(struct drm_device *dev, unsigned int pipe)
 		if (crtc->funcs->enable_vblank)
 			return crtc->funcs->enable_vblank(crtc);
 	}
-#ifdef CONFIG_DRM_LEGACY
-	else if (dev->driver->enable_vblank) {
-		return dev->driver->enable_vblank(dev, pipe);
-	}
-#endif
 
 	return -EINVAL;
 }
@@ -1533,88 +1559,6 @@ void drm_crtc_vblank_restore(struct drm_crtc *crtc)
 }
 EXPORT_SYMBOL(drm_crtc_vblank_restore);
 
-static void drm_legacy_vblank_pre_modeset(struct drm_device *dev,
-					  unsigned int pipe)
-{
-	struct drm_vblank_crtc *vblank = &dev->vblank[pipe];
-
-	/* vblank is not initialized (IRQ not installed ?), or has been freed */
-	if (!drm_dev_has_vblank(dev))
-		return;
-
-	if (drm_WARN_ON(dev, pipe >= dev->num_crtcs))
-		return;
-
-	/*
-	 * To avoid all the problems that might happen if interrupts
-	 * were enabled/disabled around or between these calls, we just
-	 * have the kernel take a reference on the CRTC (just once though
-	 * to avoid corrupting the count if multiple, mismatch calls occur),
-	 * so that interrupts remain enabled in the interim.
-	 */
-	if (!vblank->inmodeset) {
-		vblank->inmodeset = 0x1;
-		if (drm_vblank_get(dev, pipe) == 0)
-			vblank->inmodeset |= 0x2;
-	}
-}
-
-static void drm_legacy_vblank_post_modeset(struct drm_device *dev,
-					   unsigned int pipe)
-{
-	struct drm_vblank_crtc *vblank = &dev->vblank[pipe];
-
-	/* vblank is not initialized (IRQ not installed ?), or has been freed */
-	if (!drm_dev_has_vblank(dev))
-		return;
-
-	if (drm_WARN_ON(dev, pipe >= dev->num_crtcs))
-		return;
-
-	if (vblank->inmodeset) {
-		spin_lock_irq(&dev->vbl_lock);
-		drm_reset_vblank_timestamp(dev, pipe);
-		spin_unlock_irq(&dev->vbl_lock);
-
-		if (vblank->inmodeset & 0x2)
-			drm_vblank_put(dev, pipe);
-
-		vblank->inmodeset = 0;
-	}
-}
-
-int drm_legacy_modeset_ctl_ioctl(struct drm_device *dev, void *data,
-				 struct drm_file *file_priv)
-{
-	struct drm_modeset_ctl *modeset = data;
-	unsigned int pipe;
-
-	/* If drm_vblank_init() hasn't been called yet, just no-op */
-	if (!drm_dev_has_vblank(dev))
-		return 0;
-
-	/* KMS drivers handle this internally */
-	if (!drm_core_check_feature(dev, DRIVER_LEGACY))
-		return 0;
-
-	pipe = modeset->crtc;
-	if (pipe >= dev->num_crtcs)
-		return -EINVAL;
-
-	switch (modeset->cmd) {
-	case _DRM_PRE_MODESET:
-		drm_legacy_vblank_pre_modeset(dev, pipe);
-		break;
-	case _DRM_POST_MODESET:
-		drm_legacy_vblank_post_modeset(dev, pipe);
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
 static int drm_queue_vblank_event(struct drm_device *dev, unsigned int pipe,
 				  u64 req_seq,
 				  union drm_wait_vblank *vblwait,
@@ -1739,10 +1683,6 @@ static void drm_wait_vblank_reply(struct drm_device *dev, unsigned int pipe,
 
 static bool drm_wait_vblank_supported(struct drm_device *dev)
 {
-#if IS_ENABLED(CONFIG_DRM_LEGACY)
-	if (unlikely(drm_core_check_feature(dev, DRIVER_LEGACY)))
-		return dev->irq_enabled;
-#endif
 	return drm_dev_has_vblank(dev);
 }
 

@@ -5,6 +5,7 @@
 use super::types::*;
 use crate::default_zeroed;
 use core::sync::atomic::Ordering;
+use kernel::static_assert;
 
 pub(crate) mod raw {
     use super::*;
@@ -172,16 +173,23 @@ pub(crate) enum DeviceControlMsg {
     Unk0a(Array<DEVICECONTROL_SZ::ver, u8>),
     Unk0b(Array<DEVICECONTROL_SZ::ver, u8>),
     Unk0c(Array<DEVICECONTROL_SZ::ver, u8>),
-    Unk0d(Array<DEVICECONTROL_SZ::ver, u8>),
+    GrowTVBAck {
+        unk_4: u32,
+        buffer_slot: u32,
+        vm_slot: u32,
+        counter: u32,
+        subpipe: u32,
+        __pad: Pad<{ DEVICECONTROL_SZ::ver - 0x14 }>,
+    },
     Unk0e(Array<DEVICECONTROL_SZ::ver, u8>),
     Unk0f(Array<DEVICECONTROL_SZ::ver, u8>),
     Unk10(Array<DEVICECONTROL_SZ::ver, u8>),
     Unk11(Array<DEVICECONTROL_SZ::ver, u8>),
     Unk12(Array<DEVICECONTROL_SZ::ver, u8>),
     Unk13(Array<DEVICECONTROL_SZ::ver, u8>),
-    Unk14(Array<DEVICECONTROL_SZ::ver, u8>),
-    Unk15(Array<DEVICECONTROL_SZ::ver, u8>),
-    Unk16(Array<DEVICECONTROL_SZ::ver, u8>),
+    Unk14(Array<DEVICECONTROL_SZ::ver, u8>), // Init?
+    Unk15(Array<DEVICECONTROL_SZ::ver, u8>), // Enable something
+    Unk16(Array<DEVICECONTROL_SZ::ver, u8>), // Disable something
     #[ver(V >= V13_3)]
     Unk17(Array<DEVICECONTROL_SZ::ver, u8>),
     DestroyContext {
@@ -205,8 +213,11 @@ pub(crate) enum DeviceControlMsg {
         __pad2: Pad<{ DEVICECONTROL_SZ::ver - 0x18 }>,
     },
     Unk18(Array<DEVICECONTROL_SZ::ver, u8>),
-    Initialize(Pad<DEVICECONTROL_SZ::ver>),
+    Initialize(Pad<DEVICECONTROL_SZ::ver>), // Update RegionC
 }
+
+#[versions(AGX)]
+static_assert!(core::mem::size_of::<DeviceControlMsg::ver>() == 4 + DEVICECONTROL_SZ::ver);
 
 #[versions(AGX)]
 default_zeroed!(DeviceControlMsg::ver);
@@ -238,11 +249,20 @@ pub(crate) enum EventMsg {
     Timeout {
         counter: u32,
         unk_8: u32,
-        event_slot: u32,
-    }, // Max discriminant: 0x4
+        event_slot: i32,
+    },
+    Unk5(Array<EVENT_SZ, u8>),
+    Unk6(Array<EVENT_SZ, u8>),
+    GrowTVB {
+        vm_slot: u32,
+        buffer_slot: u32,
+        counter: u32,
+    }, // Max discriminant: 0x7
 }
 
-pub(crate) const EVENT_MAX: u32 = 0x4;
+static_assert!(core::mem::size_of::<EventMsg>() == 4 + EVENT_SZ);
+
+pub(crate) const EVENT_MAX: u32 = 0x7;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -377,6 +397,9 @@ pub(crate) enum StatsMsg {
         tmax: u32,
     }, // Max discriminant: 0xe
 }
+
+#[versions(AGX)]
+static_assert!(core::mem::size_of::<StatsMsg::ver>() == 4 + STATS_SZ::ver);
 
 #[versions(AGX)]
 pub(crate) const STATS_MAX: u32 = 0xe;

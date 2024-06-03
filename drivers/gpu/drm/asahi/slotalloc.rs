@@ -130,7 +130,7 @@ impl<T: SlotItem> SlotAllocator<T> {
     pub(crate) fn new(
         num_slots: u32,
         mut data: T::Data,
-        mut constructor: impl FnMut(&mut T::Data, u32) -> T,
+        mut constructor: impl FnMut(&mut T::Data, u32) -> Option<T>,
         name: &'static CStr,
         lock_key1: LockClassKey,
         lock_key2: LockClassKey,
@@ -139,8 +139,8 @@ impl<T: SlotItem> SlotAllocator<T> {
 
         for i in 0..num_slots {
             slots
-                .try_push(Some(Entry {
-                    item: constructor(&mut data, i),
+                .try_push(constructor(&mut data, i).map(|item| Entry {
+                    item,
                     get_time: 0,
                     drop_time: 0,
                 }))
@@ -231,7 +231,7 @@ impl<T: SlotItem> SlotAllocator<T> {
                     );
                 }
                 first = false;
-                if self.0.cond.wait(&mut inner) {
+                if self.0.cond.wait_interruptible(&mut inner) {
                     return Err(ERESTARTSYS);
                 }
             } else {

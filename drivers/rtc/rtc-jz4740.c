@@ -11,7 +11,7 @@
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/property.h>
@@ -349,7 +349,7 @@ static int jz4740_rtc_probe(struct platform_device *pdev)
 	if (!rtc)
 		return -ENOMEM;
 
-	rtc->type = (enum jz4740_rtc_type)device_get_match_data(dev);
+	rtc->type = (uintptr_t)device_get_match_data(dev);
 
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
@@ -414,7 +414,8 @@ static int jz4740_rtc_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, ret,
 					     "Unable to register clk32k clock\n");
 
-		ret = of_clk_add_hw_provider(np, of_clk_hw_simple_get, &rtc->clk32k);
+		ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get,
+						  &rtc->clk32k);
 		if (ret)
 			return dev_err_probe(dev, ret,
 					     "Unable to register clk32k clock provider\n");

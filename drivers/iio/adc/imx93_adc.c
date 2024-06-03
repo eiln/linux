@@ -93,6 +93,10 @@ static const struct iio_chan_spec imx93_adc_iio_channels[] = {
 	IMX93_ADC_CHAN(1),
 	IMX93_ADC_CHAN(2),
 	IMX93_ADC_CHAN(3),
+	IMX93_ADC_CHAN(4),
+	IMX93_ADC_CHAN(5),
+	IMX93_ADC_CHAN(6),
+	IMX93_ADC_CHAN(7),
 };
 
 static void imx93_adc_power_down(struct imx93_adc *adc)
@@ -236,8 +240,7 @@ static int imx93_adc_read_raw(struct iio_dev *indio_dev,
 {
 	struct imx93_adc *adc = iio_priv(indio_dev);
 	struct device *dev = adc->dev;
-	long ret;
-	u32 vref_uv;
+	int ret;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
@@ -253,10 +256,10 @@ static int imx93_adc_read_raw(struct iio_dev *indio_dev,
 		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SCALE:
-		ret = vref_uv = regulator_get_voltage(adc->vref);
+		ret = regulator_get_voltage(adc->vref);
 		if (ret < 0)
 			return ret;
-		*val = vref_uv / 1000;
+		*val = ret / 1000;
 		*val2 = 12;
 		return IIO_VAL_FRACTIONAL_LOG2;
 
@@ -393,7 +396,7 @@ error_regulator_disable:
 	return ret;
 }
 
-static int imx93_adc_remove(struct platform_device *pdev)
+static void imx93_adc_remove(struct platform_device *pdev)
 {
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
 	struct imx93_adc *adc = iio_priv(indio_dev);
@@ -411,8 +414,6 @@ static int imx93_adc_remove(struct platform_device *pdev)
 	free_irq(adc->irq, adc);
 	clk_disable_unprepare(adc->ipg_clk);
 	regulator_disable(adc->vref);
-
-	return 0;
 }
 
 static int imx93_adc_runtime_suspend(struct device *dev)
@@ -469,7 +470,7 @@ MODULE_DEVICE_TABLE(of, imx93_adc_match);
 
 static struct platform_driver imx93_adc_driver = {
 	.probe		= imx93_adc_probe,
-	.remove		= imx93_adc_remove,
+	.remove_new	= imx93_adc_remove,
 	.driver		= {
 		.name	= IMX93_ADC_DRIVER_NAME,
 		.of_match_table = imx93_adc_match,

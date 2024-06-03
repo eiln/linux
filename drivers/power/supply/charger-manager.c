@@ -1331,7 +1331,7 @@ static struct charger_desc *of_cm_parse_desc(struct device *dev)
 	of_property_read_string(np, "cm-thermal-zone", &desc->thermal_zone);
 
 	of_property_read_u32(np, "cm-battery-cold", &desc->temp_min);
-	if (of_get_property(np, "cm-battery-cold-in-minus", NULL))
+	if (of_property_read_bool(np, "cm-battery-cold-in-minus"))
 		desc->temp_min *= -1;
 	of_property_read_u32(np, "cm-battery-hot", &desc->temp_max);
 	of_property_read_u32(np, "cm-battery-temp-diff", &desc->temp_diff);
@@ -1516,9 +1516,11 @@ static int charger_manager_probe(struct platform_device *pdev)
 	memcpy(&cm->charger_psy_desc, &psy_default, sizeof(psy_default));
 
 	if (!desc->psy_name)
-		strncpy(cm->psy_name_buf, psy_default.name, PSY_NAME_MAX);
+		strscpy(cm->psy_name_buf, psy_default.name,
+			sizeof(cm->psy_name_buf));
 	else
-		strncpy(cm->psy_name_buf, desc->psy_name, PSY_NAME_MAX);
+		strscpy(cm->psy_name_buf, desc->psy_name,
+			sizeof(cm->psy_name_buf));
 	cm->charger_psy_desc.name = cm->psy_name_buf;
 
 	/* Allocate for psy properties because they may vary */
@@ -1628,7 +1630,7 @@ err_reg_extcon:
 	return ret;
 }
 
-static int charger_manager_remove(struct platform_device *pdev)
+static void charger_manager_remove(struct platform_device *pdev)
 {
 	struct charger_manager *cm = platform_get_drvdata(pdev);
 	struct charger_desc *desc = cm->desc;
@@ -1648,8 +1650,6 @@ static int charger_manager_remove(struct platform_device *pdev)
 	power_supply_unregister(cm->charger_psy);
 
 	try_charger_enable(cm, false);
-
-	return 0;
 }
 
 static const struct platform_device_id charger_manager_id[] = {
@@ -1740,7 +1740,7 @@ static struct platform_driver charger_manager_driver = {
 		.of_match_table = charger_manager_match,
 	},
 	.probe = charger_manager_probe,
-	.remove = charger_manager_remove,
+	.remove_new = charger_manager_remove,
 	.id_table = charger_manager_id,
 };
 

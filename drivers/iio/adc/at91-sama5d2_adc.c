@@ -1194,7 +1194,7 @@ static void at91_dma_buffer_done(void *data)
 {
 	struct iio_dev *indio_dev = data;
 
-	iio_trigger_poll_chained(indio_dev->trig);
+	iio_trigger_poll_nested(indio_dev->trig);
 }
 
 static int at91_adc_dma_start(struct iio_dev *indio_dev)
@@ -2400,12 +2400,8 @@ static int at91_adc_probe(struct platform_device *pdev)
 	st->dma_st.phys_addr = res->start;
 
 	st->irq = platform_get_irq(pdev, 0);
-	if (st->irq <= 0) {
-		if (!st->irq)
-			st->irq = -ENXIO;
-
+	if (st->irq < 0)
 		return st->irq;
-	}
 
 	st->per_clk = devm_clk_get(&pdev->dev, "adc_clk");
 	if (IS_ERR(st->per_clk))
@@ -2490,7 +2486,7 @@ reg_disable:
 	return ret;
 }
 
-static int at91_adc_remove(struct platform_device *pdev)
+static void at91_adc_remove(struct platform_device *pdev)
 {
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
 	struct at91_adc_state *st = iio_priv(indio_dev);
@@ -2505,8 +2501,6 @@ static int at91_adc_remove(struct platform_device *pdev)
 
 	regulator_disable(st->vref);
 	regulator_disable(st->reg);
-
-	return 0;
 }
 
 static int at91_adc_suspend(struct device *dev)
@@ -2631,7 +2625,7 @@ MODULE_DEVICE_TABLE(of, at91_adc_dt_match);
 
 static struct platform_driver at91_adc_driver = {
 	.probe = at91_adc_probe,
-	.remove = at91_adc_remove,
+	.remove_new = at91_adc_remove,
 	.driver = {
 		.name = "at91-sama5d2_adc",
 		.of_match_table = at91_adc_dt_match,

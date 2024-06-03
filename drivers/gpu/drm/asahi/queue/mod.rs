@@ -53,9 +53,10 @@ struct SubQueue {
 
 #[versions(AGX)]
 impl SubQueue::ver {
-    fn new_job(&mut self) -> SubQueueJob::ver {
+    fn new_job(&mut self, fence: dma_fence::Fence) -> SubQueueJob::ver {
         SubQueueJob::ver {
             wq: self.wq.clone(),
+            fence: Some(fence),
             job: None,
         }
     }
@@ -65,6 +66,7 @@ impl SubQueue::ver {
 struct SubQueueJob {
     wq: Arc<workqueue::WorkQueue::ver>,
     job: Option<workqueue::Job::ver>,
+    fence: Option<dma_fence::Fence>,
 }
 
 #[versions(AGX)]
@@ -72,7 +74,8 @@ impl SubQueueJob::ver {
     fn get(&mut self) -> Result<&mut workqueue::Job::ver> {
         if self.job.is_none() {
             mod_pr_debug!("SubQueueJob: Creating {:?} job\n", self.wq.pipe_type());
-            self.job.replace(self.wq.new_job()?);
+            self.job
+                .replace(self.wq.new_job(self.fence.take().unwrap())?);
         }
         Ok(self.job.as_mut().expect("expected a Job"))
     }
@@ -84,11 +87,8 @@ impl SubQueueJob::ver {
         }
     }
 
-    fn can_submit(&self) -> bool {
-        match self.job.as_ref() {
-            None => true,
-            Some(job) => job.can_submit(),
-        }
+    fn can_submit(&self) -> Option<Fence> {
+        self.job.as_ref().and_then(|job| job.can_submit())
     }
 }
 
@@ -170,13 +170,31 @@ pub(crate) struct QueueJob {
 #[versions(AGX)]
 impl QueueJob::ver {
     fn get_vtx(&mut self) -> Result<&mut workqueue::Job::ver> {
-        self.sj_vtx.as_mut().ok_or(EINVAL)?.get()
+        self.sj_vtx
+            .as_mut()
+            .ok_or_else(|| {
+                cls_pr_debug!(Errors, "No vertex queue\n");
+                EINVAL
+            })?
+            .get()
     }
     fn get_frag(&mut self) -> Result<&mut workqueue::Job::ver> {
-        self.sj_frag.as_mut().ok_or(EINVAL)?.get()
+        self.sj_frag
+            .as_mut()
+            .ok_or_else(|| {
+                cls_pr_debug!(Errors, "No fragment queue\n");
+                EINVAL
+            })?
+            .get()
     }
     fn get_comp(&mut self) -> Result<&mut workqueue::Job::ver> {
-        self.sj_comp.as_mut().ok_or(EINVAL)?.get()
+        self.sj_comp
+            .as_mut()
+            .ok_or_else(|| {
+                cls_pr_debug!(Errors, "No compute queue\n");
+                EINVAL
+            })?
+            .get()
     }
 
     fn commit(&mut self) -> Result {
@@ -193,40 +211,40 @@ impl QueueJob::ver {
 
 #[versions(AGX)]
 impl sched::JobImpl for QueueJob::ver {
-    fn can_run(job: &mut sched::Job<Self>) -> bool {
+    fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
         mod_dev_dbg!(job.dev, "QueueJob {}: Checking runnability\n", job.id);
 
         if let Some(sj) = job.sj_vtx.as_ref() {
-            if !sj.can_submit() {
+            if let Some(fence) = sj.can_submit() {
                 mod_dev_dbg!(
                     job.dev,
                     "QueueJob {}: Blocking due to vertex queue full\n",
                     job.id
                 );
-                return false;
+                return Some(fence);
             }
         }
         if let Some(sj) = job.sj_frag.as_ref() {
-            if !sj.can_submit() {
+            if let Some(fence) = sj.can_submit() {
                 mod_dev_dbg!(
                     job.dev,
                     "QueueJob {}: Blocking due to fragment queue full\n",
                     job.id
                 );
-                return false;
+                return Some(fence);
             }
         }
         if let Some(sj) = job.sj_comp.as_ref() {
-            if !sj.can_submit() {
+            if let Some(fence) = sj.can_submit() {
                 mod_dev_dbg!(
                     job.dev,
                     "QueueJob {}: Blocking due to compute queue full\n",
                     job.id
                 );
-                return false;
+                return Some(fence);
             }
         }
-        true
+        None
     }
 
     #[allow(unused_assignments)]
@@ -354,7 +372,7 @@ impl Queue::ver {
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         event_manager: Arc<event::EventManager>,
-        mgr: &buffer::BufferManager,
+        mgr: &buffer::BufferManager::ver,
         id: u64,
         priority: u32,
         caps: u32,
@@ -363,7 +381,8 @@ impl Queue::ver {
 
         let data = dev.data();
 
-        let mut notifier_list = alloc.private.new_default::<fw::event::NotifierList>()?;
+        // Must be shared, no cache management on this one!
+        let mut notifier_list = alloc.shared.new_default::<fw::event::NotifierList>()?;
 
         let self_ptr = notifier_list.weak_pointer();
         notifier_list.with_mut(|raw, _inner| {
@@ -386,10 +405,7 @@ impl Queue::ver {
                 },
             )?)?;
 
-        // SAFETY: I give up. This is unsafe and there is no reasonable way to make it safe.
-        // Known broken. Will crash and burn and oops under corner cases like apps getting kill -9'd.
-        let sched =
-            unsafe { sched::Scheduler::new(dev, WQ_SIZE, 0, 100000, c_str!("asahi_sched"))? };
+        let sched = sched::Scheduler::new(dev, 3, WQ_SIZE, 0, 100000, c_str!("asahi_sched"))?;
         // Priorities are handled by the AGX scheduler, there is no meaning within a
         // per-queue scheduler.
         let entity = sched::Entity::new(&sched, sched::Priority::Normal)?;
@@ -537,6 +553,7 @@ impl Queue for Queue::ver {
 
         // Empty submissions are not legal
         if commands.is_empty() {
+            cls_pr_debug!(Errors, "Empty submission\n");
             return Err(EINVAL);
         }
 
@@ -556,23 +573,35 @@ impl Queue for Queue::ver {
         let vm_slot = vm_bind.slot();
 
         mod_dev_dbg!(self.dev, "[Submission {}] Creating job\n", id);
-        let mut job = self.entity.new_job(QueueJob::ver {
+
+        let fence: UserFence<JobFence::ver> = self
+            .fence_ctx
+            .new_fence::<JobFence::ver>(
+                0,
+                JobFence::ver {
+                    id,
+                    pending: Default::default(),
+                },
+            )?
+            .into();
+
+        let mut job = self.entity.new_job(1, QueueJob::ver {
             dev: self.dev.clone(),
             vm_bind,
             op_guard,
-            sj_vtx: self.q_vtx.as_mut().map(|a| a.new_job()),
-            sj_frag: self.q_frag.as_mut().map(|a| a.new_job()),
-            sj_comp: self.q_comp.as_mut().map(|a| a.new_job()),
-            fence: self
-                .fence_ctx
-                .new_fence::<JobFence::ver>(
-                    0,
-                    JobFence::ver {
-                        id,
-                        pending: Default::default(),
-                    },
-                )?
-                .into(),
+            sj_vtx: self
+                .q_vtx
+                .as_mut()
+                .map(|a| a.new_job(Fence::from_fence(&fence))),
+            sj_frag: self
+                .q_frag
+                .as_mut()
+                .map(|a| a.new_job(Fence::from_fence(&fence))),
+            sj_comp: self
+                .q_comp
+                .as_mut()
+                .map(|a| a.new_job(Fence::from_fence(&fence))),
+            fence,
             did_run: false,
             id,
         })?;
@@ -594,7 +623,10 @@ impl Queue for Queue::ver {
             match cmd.cmd_type {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => last_render = Some(i),
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => last_compute = Some(i),
-                _ => return Err(EINVAL),
+                _ => {
+                    cls_pr_debug!(Errors, "Unknown command type {}\n", cmd.cmd_type);
+                    return Err(EINVAL);
+                }
             }
         }
 
@@ -609,7 +641,10 @@ impl Queue for Queue::ver {
                 if *index == uapi::DRM_ASAHI_BARRIER_NONE as u32 {
                     continue;
                 }
-                if let Some(event) = events[queue_idx].get(*index as usize).ok_or(EINVAL)? {
+                if let Some(event) = events[queue_idx].get(*index as usize).ok_or_else(|| {
+                    cls_pr_debug!(Errors, "Invalid barrier #{}: {}\n", queue_idx, index);
+                    EINVAL
+                })? {
                     let mut alloc = gpu.alloc();
                     let queue_job = match cmd.cmd_type {
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => job.get_vtx()?,
@@ -643,18 +678,29 @@ impl Queue for Queue::ver {
             let result_writer = match result_buf.as_ref() {
                 None => {
                     if cmd.result_offset != 0 || cmd.result_size != 0 {
+                        cls_pr_debug!(Errors, "No result buffer but result requested\n");
                         return Err(EINVAL);
                     }
                     None
                 }
                 Some(buf) => {
                     if cmd.result_size != 0 {
-                        if cmd
+                        let end_offset = cmd
                             .result_offset
                             .checked_add(cmd.result_size)
-                            .ok_or(EINVAL)?
-                            > buf.size() as u64
-                        {
+                            .ok_or_else(|| {
+                                cls_pr_debug!(Errors, "result_offset + result_size overflow\n");
+                                EINVAL
+                            })?;
+                        if end_offset > buf.size() as u64 {
+                            cls_pr_debug!(
+                                Errors,
+                                "Result buffer overflow ({} + {} > {})\n",
+                                cmd.result_offset,
+                                cmd.result_size,
+                                buf.size()
+                            );
+
                             return Err(EINVAL);
                         }
                         Some(ResultWriter {
